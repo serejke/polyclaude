@@ -945,7 +945,11 @@ def tab_at(x: int) -> int | None:
 
 
 WHEEL_UP = curses.BUTTON4_PRESSED
-WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0)
+# ncurses with mouse API v2 has a button 5 for wheel-down. With API v1 (e.g.
+# the ncurses 6.0 in uv's Python builds) wheel-down arrives as
+# REPORT_MOUSE_POSITION, and only when that bit is in the mask. ncurses still
+# enables only tracking mode 1000, so real mouse motion is never reported.
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0) or curses.REPORT_MOUSE_POSITION
 
 
 def read_mouse() -> tuple[int, int, str] | None:
@@ -960,7 +964,7 @@ def read_mouse() -> tuple[int, int, str] | None:
         return x, y, "click"
     if b & WHEEL_UP:
         return x, y, "up"
-    if WHEEL_DOWN and b & WHEEL_DOWN:
+    if b & WHEEL_DOWN:
         return x, y, "down"
     return None
 
