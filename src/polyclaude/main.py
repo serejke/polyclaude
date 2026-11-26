@@ -131,6 +131,7 @@ class SessionInfo:
     stats_loaded: bool = False  # counters/duration come from a full parse, done in the background
     raw_content: str = ""
     raw_loaded: bool = False    # raw_content is read on the first search
+    last_epoch: float = 0.0     # last activity; the Resume list sorts by it
 
 
 @dataclass
@@ -255,20 +256,23 @@ def is_tool_result_only(content) -> bool:
     return False
 
 
+NOISE_PREFIXES = ("<local-command-", "<command-name>", "<command-message>",
+                  "<task-notification>", "<system-reminder>", "[Request interrupted")
+
+
 def is_noise(text: str) -> bool:
-    return (
-        text.startswith("<local-command-")
-        or text.startswith("<command-name>")
-        or text.startswith("<command-message>")
-        or not text
-    )
+    """Text that Claude Code injects into a user turn, not text a person typed."""
+    return not text or text.startswith(NOISE_PREFIXES)
 
 
 def human_user_text(obj: dict) -> str | None:
     """Text of a human-typed user message, or None for anything else
-    (assistant turns, tool results, slash-command noise, metadata lines)."""
-    if obj.get("type") != "user":
+    (assistant turns, tool results, slash-command noise, injected lines)."""
+    if obj.get("type") != "user" or obj.get("isMeta"):
         return None
+    origin = obj.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return None  # e.g. a background task notification
     content = obj.get("message", {}).get("content", "")
     if is_tool_result_only(content):
         return None
@@ -310,6 +314,16 @@ def human_relative_time(epoch: float) -> str:
     if delta < 86400:
         return f"{int(delta / 3600)}h ago"
     return f"{int(delta / 86400)}d ago"
+
+
+def when_label(epoch: float) -> str:
+    """Relative time up to 7 days ("5m ago", "2d ago"), then the date."""
+    if epoch <= 0:
+        return "?"
+    if time.time() - epoch < 7 * 86400:
+        return human_relative_time(epoch)
+    t = time.localtime(epoch)
+    return time.strftime("%b %d" if t.tm_year == time.localtime().tm_year else "%Y-%m-%d", t)
 
 
 def peek_session_cwd(path: Path, max_lines: int = 5) -> str | None:
@@ -469,12 +483,9 @@ def parse_session(jsonl_path: Path, load_messages: bool = False) -> SessionInfo 
                             if c.get("name") == "Agent":
                                 n_agent += 1
 
-                # For user type: skip tool results (automated)
                 if msg_type == "user":
-                    if is_tool_result_only(content):
-                        continue
-                    text = extract_text(content)
-                    if is_noise(text):
+                    text = human_user_text(obj)
+                    if text is None:
                         continue
                     n_user += 1
                     ts = obj.get("timestamp", "")
@@ -630,6 +641,7 @@ def scan_session_meta(jsonl_path: Path) -> SessionInfo | None:
         last_user_msg=last_user or first_user,
         timestamp_first=ts_first or "",
         timestamp_last=ts_last or ts_first or "",
+        last_epoch=parse_ts_epoch(ts_last or "") or mtime,
     )
 
 
@@ -741,6 +753,9 @@ def find_sessions(top_n: int) -> list[SessionInfo]:
             sessions.append(info)
         if len(sessions) >= top_n:
             break
+    # File mtime only picks the candidates: Claude Code can append lines without
+    # a timestamp long after the last activity, so sort by the activity itself.
+    sessions.sort(key=lambda x: x.last_epoch, reverse=True)
     return sessions
 
 
@@ -1047,6 +1062,57 @@ def draw_start_view(stdscr, items: list[StartItem], rows: list[int | str],
     stdscr.refresh()
 
 
+COL = 13  # Resume rows: time in columns 3-12, everything else from here
+
+
+def session_height(s: SessionInfo, match_snippets: dict | None) -> int:
+    """Rows that draw_session_rows uses, plus one blank separator row."""
+    n = 4 if s.first_user_msg != s.last_user_msg else 3
+    if match_snippets is not None:
+        n += len(match_snippets.get(s.session_id, []))
+    return n + 1
+
+
+def draw_session_rows(stdscr, y: int, w: int, s: SessionInfo, cwd_short: str,
+                      lx: LiveSession | None, snippets: list[str]):
+    """  5m ago   name-or-path            ● busy (bg)
+                ~/path  24m  you:18  claude:40  tools:42
+                first: ...
+                 last: ...                                """
+    safe_addstr(stdscr, y, 3, when_label(s.last_epoch), curses.color_pair(C_IDX))
+    title, title_attr = (s.name, curses.color_pair(C_TITLE) | curses.A_BOLD) if s.name \
+        else (cwd_short, curses.color_pair(C_PATH) | curses.A_BOLD)
+    title = truncate(title, max(10, w - COL - 24))
+    safe_addstr(stdscr, y, COL, title, title_attr)
+    if lx:
+        kind = "bg" if lx.kind == "background" else "terminal"
+        safe_addstr(stdscr, y, COL + len(title) + 3, f"● {lx.status} ({kind})",
+                    status_attr(lx.status))
+
+    if not s.stats_loaded:
+        stats = "…"
+    else:
+        d = s.duration_min
+        stats = f"{d // 60}h{d % 60:02d}m" if d >= 60 else f"{d}m"
+        stats += f"  you:{s.user_msgs}  claude:{s.assistant_msgs}  tools:{s.tool_uses}"
+        if s.agent_msgs:
+            stats += f"  agents:{s.agent_msgs}"
+    x = COL
+    if s.name:
+        safe_addstr(stdscr, y + 1, x, cwd_short, curses.color_pair(C_PATH))
+        x += len(cwd_short) + 2
+    safe_addstr(stdscr, y + 1, x, stats, curses.A_DIM)
+
+    lines = [("first:", s.first_user_msg, 0)]
+    if s.first_user_msg != s.last_user_msg:
+        lines.append((" last:", s.last_user_msg, 0))
+    lines += [("match:", sn, curses.A_BOLD) for sn in snippets]
+    for i, (label, text, extra) in enumerate(lines):
+        safe_addstr(stdscr, y + 2 + i, COL, label, curses.color_pair(C_LABEL))
+        safe_addstr(stdscr, y + 2 + i, COL + 7, truncate(text, max(10, w - COL - 10)),
+                    curses.color_pair(C_TEXT) | extra)
+
+
 def draw_list_view(stdscr, sessions: list[SessionInfo], cursor: int, scroll: int,
                    search_mode: bool = False, search_query: str = "",
                    active_query: str = "", match_snippets: dict | None = None,
@@ -1091,74 +1157,12 @@ def draw_list_view(stdscr, sessions: list[SessionInfo], cursor: int, scroll: int
             s = sessions[i]
             is_sel = i == cursor
             cwd_short = s.cwd.replace(HOME, "~")
-            ts = format_ts(s.timestamp_last)
-
-            marker = " > " if is_sel else "   "
-
-            attr_marker = curses.color_pair(C_IDX) | curses.A_BOLD
-            attr_path = curses.color_pair(C_PATH) | curses.A_BOLD
-            attr_dim = curses.A_DIM
-
-            # Optional header: session name (if user-set), in blue
-            if s.name:
-                attr_name = curses.color_pair(C_TITLE) | curses.A_BOLD
-                name_width = max(10, w - len(marker) - 2)
-                safe_addstr(stdscr, y, 0, marker, attr_marker if is_sel else 0)
-                safe_addstr(stdscr, y, len(marker), truncate(s.name, name_width), attr_name)
-                y += 1
-                cwd_marker = "   "  # already shown the row marker
-            else:
-                cwd_marker = marker
-
-            # Line 1: marker (or indent) + cwd + timestamp
-            safe_addstr(stdscr, y, 0, cwd_marker,
-                        attr_marker if (is_sel and not s.name) else 0)
-            safe_addstr(stdscr, y, len(cwd_marker), cwd_short, attr_path)
-            safe_addstr(stdscr, y, len(cwd_marker) + len(cwd_short) + 2, ts, attr_dim)
-            lx = live.by_sid.get(s.session_id) if live else None
-            if lx:
-                kind = "bg" if lx.kind == "background" else "terminal"
-                safe_addstr(stdscr, y, len(cwd_marker) + len(cwd_short) + len(ts) + 4,
-                            f"● {lx.status} ({kind})", status_attr(lx.status))
-            y += 1
-
-            # Line 2: stats
-            if not s.stats_loaded:
-                stats = "…"
-            else:
-                if s.duration_min >= 60:
-                    dur = f"{s.duration_min // 60}h{s.duration_min % 60:02d}m"
-                else:
-                    dur = f"{s.duration_min}m"
-                stats = f"{dur}  you:{s.user_msgs}  claude:{s.assistant_msgs}  tools:{s.tool_uses}"
-                if s.agent_msgs > 0:
-                    stats += f"  agents:{s.agent_msgs}"
-            safe_addstr(stdscr, y, 5, stats, attr_dim)
-            y += 1
-
-            # Line 3: first message
-            safe_addstr(stdscr, y, 5, "first:", curses.color_pair(C_LABEL))
-            safe_addstr(stdscr, y, 11, " " + truncate(s.first_user_msg, w - 13), curses.color_pair(C_TEXT))
-            y += 1
-
-            # Line 4: last message (if different)
-            if s.first_user_msg != s.last_user_msg:
-                safe_addstr(stdscr, y, 5, " last:", curses.color_pair(C_LABEL))
-                safe_addstr(stdscr, y, 11, " " + truncate(s.last_user_msg, w - 13), curses.color_pair(C_TEXT))
-            y += 1
-
-            # Match snippets (search mode only)
-            if has_snippets and s.session_id in match_snippets:
-                for snippet in match_snippets[s.session_id]:
-                    if y >= h - 1:
-                        break
-                    safe_addstr(stdscr, y, 5, "match:", curses.color_pair(C_LABEL))
-                    safe_addstr(stdscr, y, 11, " " + truncate(snippet, w - 13),
-                                curses.color_pair(C_TEXT) | curses.A_BOLD)
-                    y += 1
-
-            # separator
-            y += 1
+            safe_addstr(stdscr, y, 0, " > " if is_sel else "   ",
+                        curses.color_pair(C_IDX) | curses.A_BOLD if is_sel else 0)
+            draw_session_rows(stdscr, y, w, s, cwd_short,
+                              live.by_sid.get(s.session_id) if live else None,
+                              match_snippets.get(s.session_id, []) if has_snippets else [])
+            y += session_height(s, match_snippets if has_snippets else None)
 
     # Footer / search input
     safe_addstr(stdscr, h - 1, 0, " " * w, curses.color_pair(C_HEADER) if search_mode else curses.A_DIM)
@@ -1378,14 +1382,8 @@ def curses_main(stdscr, sessions: list[SessionInfo],
             # Compute actual height of each session item
             in_search_now = bool(active_query)
             def item_height(idx):
-                s = display_sessions[idx]
-                lines = 4  # marker+path, stats, first msg, separator
-                if s.first_user_msg != s.last_user_msg:
-                    lines += 1
-                if s.name:
-                    lines += 1  # optional name header
-                if has_snippets and s.session_id in match_snippets:
-                    lines += len(match_snippets[s.session_id])
+                lines = session_height(display_sessions[idx],
+                                       match_snippets if has_snippets else None)
                 # section header above this item
                 if section_header(idx, display_sessions, current_cwd, in_search_now):
                     lines += 1
