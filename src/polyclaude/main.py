@@ -140,6 +140,16 @@ class CwdEntry:
     last_used_epoch: float
 
 
+def tty_of(pid: int) -> str:
+    """Controlling terminal of a process (e.g. "ttys009"), or "" if unknown."""
+    try:
+        out = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "" if out in ("", "?", "??") else out
+
+
 @dataclass
 class LiveSession:
     """A running session as reported by ``claude agents --json``."""
@@ -158,11 +168,19 @@ class LiveSession:
         return self.kind == "background" and bool(self.agent_id)
 
 
+    def hint(self) -> str:
+        """What to do with a session that cannot be attached."""
+        tty = tty_of(self.pid)
+        where = f" ({tty})" if tty else ""
+        return (f" Runs in the foreground of another terminal{where}. "
+                "Type /bg there to move it to the background, then attach here. ")
+
+
 def fetch_live_sessions(binary: str) -> list[LiveSession] | None:
     """Running sessions, or None if the claude CLI could not be queried."""
     try:
-        proc = subprocess.run([binary, "agents", "--json"], capture_output=True,
-                              text=True, timeout=10)
+        proc = subprocess.run([binary, "agents", "--json"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=10)
         data = json.loads(proc.stdout)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return None
@@ -170,49 +188,45 @@ def fetch_live_sessions(binary: str) -> list[LiveSession] | None:
         return None
     live = []
     for a in data:
-        if not isinstance(a, dict) or not a.get("sessionId"):
+        if not isinstance(a, dict) or not isinstance(a.get("sessionId"), str):
             continue
+        started, pid = a.get("startedAt"), a.get("pid")
         live.append(LiveSession(
             session_id=a["sessionId"],
-            cwd=a.get("cwd") or "?",
-            kind=a.get("kind") or "",
-            status=a.get("status") or "",
-            state=a.get("state") or "",
-            agent_id=a.get("id") or "",
-            name=a.get("name") or "",
-            started_epoch=(a.get("startedAt") or 0) / 1000,
-            pid=int(a.get("pid") or 0),
+            cwd=str(a.get("cwd") or "?"),
+            kind=str(a.get("kind") or ""),
+            status=str(a.get("status") or ""),
+            state=str(a.get("state") or ""),
+            agent_id=str(a.get("id") or ""),
+            name=str(a.get("name") or ""),
+            started_epoch=started / 1000 if isinstance(started, (int, float)) else 0.0,
+            pid=pid if isinstance(pid, int) else 0,
         ))
     return live
 
 
 class LivePoller:
-    """Polls ``claude agents --json`` on a daemon thread.
+    """Polls ``claude agents --json`` every 2 s on a daemon thread.
 
-    Readers take ``sessions`` / ``by_sid`` as plain attributes: each poll swaps
-    in new objects, so a reader never sees a half-updated list.
+    Each poll replaces ``sessions`` and ``by_sid`` with new objects, so the UI
+    thread never sees a half-updated list. A failed poll keeps the last result.
     """
 
-    def __init__(self, binary: str, interval: float = 2.0):
+    def __init__(self, binary: str):
         self.binary = binary
-        self.interval = interval
         self.sessions: list[LiveSession] = []
         self.by_sid: dict[str, LiveSession] = {}
         self.loaded = False
-        self.error = False
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         while True:
             live = fetch_live_sessions(self.binary)
-            if live is None:
-                self.error = True
-            else:
-                self.error = False
+            if live is not None:
                 self.by_sid = {x.session_id: x for x in live}
                 self.sessions = live
             self.loaded = True
-            time.sleep(self.interval)
+            time.sleep(2)
 
     def running_in(self, cwd: str) -> int:
         return sum(1 for x in self.sessions if x.cwd == cwd)
@@ -707,7 +721,10 @@ def find_sessions(top_n: int) -> list[SessionInfo]:
             continue
         for f in project_dir.iterdir():
             if f.suffix == ".jsonl" and f.is_file():
-                jsonl_files.append((f.stat().st_mtime, f))
+                try:
+                    jsonl_files.append((f.stat().st_mtime, f))
+                except OSError:  # deleted since iterdir
+                    continue
 
     jsonl_files.sort(key=lambda x: x[0], reverse=True)
     candidates = jsonl_files[: top_n * 3]
@@ -952,48 +969,23 @@ def status_attr(status: str) -> int:
     return curses.A_DIM
 
 
-def tty_of(pid: int) -> str:
-    """Controlling terminal of a process (e.g. "ttys009"), or "" if unknown."""
-    try:
-        out = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=2).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return "" if out in ("", "?", "??") else out
+StartItem = LiveSession | CwdEntry
 
 
-# A Start-screen item: ("live", LiveSession) or ("cwd", CwdEntry).
-StartItem = tuple[str, object]
+def item_key(item: StartItem) -> str:
+    """Stable identity, so the cursor stays on the same item when the live list refreshes."""
+    return "live:" + item.session_id if isinstance(item, LiveSession) else "cwd:" + item.cwd
 
 
-def start_items(live: list[LiveSession], entries: list[CwdEntry]) -> list[StartItem]:
-    return [("live", x) for x in live] + [("cwd", e) for e in entries]
+def start_rows(items: list[StartItem], loaded: bool) -> list[int | str]:
+    """Screen rows: an item index, or a text row ("#" prefix: header, "" blank, else a note)."""
+    live_idx = [i for i, it in enumerate(items) if isinstance(it, LiveSession)]
+    cwd_idx = [i for i, it in enumerate(items) if isinstance(it, CwdEntry)]
+    note = [] if live_idx else ["(nothing running)" if loaded else "loading…"]
+    return ["#Running", *note, *live_idx, "", "#New session in", *cwd_idx]
 
 
-def item_key(item: StartItem) -> tuple[str, str]:
-    """Stable identity, so the cursor stays on the same row when the live list refreshes."""
-    kind, obj = item
-    return (kind, obj.session_id if kind == "live" else obj.cwd)  # type: ignore[union-attr]
-
-
-def start_rows(items: list[StartItem], poller: "LivePoller | None") -> list[tuple[str, int]]:
-    """Screen rows as (kind, item index); kind is "item", "header:<text>" or "blank"."""
-    rows: list[tuple[str, int]] = []
-    n_live = sum(1 for k, _ in items if k == "live")
-    rows.append(("header:Running", -1))
-    if n_live == 0:
-        loaded = poller is not None and poller.loaded
-        rows.append(("note:" + ("(nothing running)" if loaded else "loading…"), -1))
-    for i in range(n_live):
-        rows.append(("item", i))
-    rows.append(("blank", -1))
-    rows.append(("header:New session in", -1))
-    for i in range(n_live, len(items)):
-        rows.append(("item", i))
-    return rows
-
-
-def draw_start_view(stdscr, items: list[StartItem], rows: list[tuple[str, int]],
+def draw_start_view(stdscr, items: list[StartItem], rows: list[int | str],
                     cursor: int, scroll: int, current_cwd: str,
                     poller: "LivePoller | None", flash: str = ""):
     h, w = stdscr.getmaxyx()
@@ -1002,20 +994,20 @@ def draw_start_view(stdscr, items: list[StartItem], rows: list[tuple[str, int]],
                  help_text=" Tab:switch  Enter:attach/launch  q:quit ")
 
     y = 2
-    for kind, idx in rows[scroll:]:
+    for row in rows[scroll:]:
         if y >= h - 1:
             break
-        if kind.startswith("header:"):
-            safe_addstr(stdscr, y, 2, kind[7:], curses.color_pair(C_LABEL) | curses.A_BOLD)
-        elif kind.startswith("note:"):
-            safe_addstr(stdscr, y, 5, kind[5:], curses.A_DIM)
-        elif kind == "item":
-            ikind, obj = items[idx]
-            is_sel = idx == cursor
+        if isinstance(row, str):
+            if row.startswith("#"):
+                safe_addstr(stdscr, y, 2, row[1:], curses.color_pair(C_LABEL) | curses.A_BOLD)
+            else:
+                safe_addstr(stdscr, y, 5, row, curses.A_DIM)
+        else:
+            x = items[row]
+            is_sel = row == cursor
             marker = " > " if is_sel else "   "
             safe_addstr(stdscr, y, 0, marker, curses.color_pair(C_IDX) | curses.A_BOLD if is_sel else 0)
-            if ikind == "live":
-                x: LiveSession = obj  # type: ignore[assignment]
+            if isinstance(x, LiveSession):
                 attr = status_attr(x.status)
                 safe_addstr(stdscr, y, 3, "●", attr)
                 safe_addstr(stdscr, y, 5, x.status, attr)
@@ -1032,7 +1024,7 @@ def draw_start_view(stdscr, items: list[StartItem], rows: list[tuple[str, int]],
                     meta.append(f"up {age}")
                 safe_addstr(stdscr, y, cx + len(cwd_short) + 3, "  ·  ".join(meta), curses.A_DIM)
             else:
-                e: CwdEntry = obj  # type: ignore[assignment]
+                e = x
                 cwd_short = e.cwd.replace(HOME, "~")
                 safe_addstr(stdscr, y, 3, cwd_short, curses.color_pair(C_PATH) | curses.A_BOLD)
                 parts = []
@@ -1195,7 +1187,7 @@ def wrap_text(text: str, width: int) -> list[str]:
     return result
 
 
-def draw_detail_view(stdscr, session: SessionInfo, scroll: int) -> list[str]:
+def draw_detail_view(stdscr, session: SessionInfo, scroll: int, flash: str = "") -> list[str]:
     """Draw expanded session conversation. Returns the rendered lines for scroll calc."""
     h, w = stdscr.getmaxyx()
     stdscr.erase()
@@ -1258,7 +1250,7 @@ def draw_detail_view(stdscr, session: SessionInfo, scroll: int) -> list[str]:
     safe_addstr(stdscr, h - 1, 0, " " * w, curses.A_DIM)
     msgs_count = len(session.messages)
     pct = int(scroll / max(1, total_lines - (h - 4)) * 100) if total_lines > h - 4 else 100
-    footer = f" {msgs_count} messages | scroll: {min(pct, 100)}% | Enter to resume "
+    footer = flash or f" {msgs_count} messages | scroll: {min(pct, 100)}% | Enter to resume "
     safe_addstr(stdscr, h - 1, 2, footer, curses.A_DIM)
 
     stdscr.refresh()
@@ -1278,7 +1270,7 @@ def curses_main(stdscr, sessions: list[SessionInfo],
 
     # Start tab state
     start_cursor = 0
-    start_key: tuple[str, str] | None = None
+    start_key: str | None = None
     start_scroll = 0
     flash = ""
 
@@ -1290,7 +1282,6 @@ def curses_main(stdscr, sessions: list[SessionInfo],
     list_scroll = 0
     mode = "list"  # "list" or "detail"
     detail_scroll = 0
-    detail_rendered: list = []
 
     # Search state (resume tab)
     search_mode = False
@@ -1315,19 +1306,17 @@ def curses_main(stdscr, sessions: list[SessionInfo],
         h, w = stdscr.getmaxyx()
         display_sessions = filtered_sessions if filtered_sessions is not None else all_sessions
         has_snippets = filtered_sessions is not None
-        ITEM_HEIGHT = 5  # base height without snippets
 
         # ── Start tab: running sessions, then directories for a new one ──
         if active_tab == TAB_START:
             running = sort_live(live.sessions, current_cwd) if live else []
-            items = start_items(running, cwd_entries)
-            rows = start_rows(items, live)
+            items: list[StartItem] = [*running, *cwd_entries]
+            rows = start_rows(items, live is not None and live.loaded)
             # Follow the selected item by identity across live-list refreshes.
             keys = [item_key(it) for it in items]
             start_cursor = keys.index(start_key) if start_key in keys else \
                 min(start_cursor, max(0, len(items) - 1))
-            row_of = {idx: r for r, (k, idx) in enumerate(rows) if k == "item"}
-            cur_row = row_of.get(start_cursor, 0)
+            cur_row = rows.index(start_cursor) if start_cursor in rows else 0
             usable = h - 3
             if cur_row - 1 < start_scroll:   # keep the section header above visible
                 start_scroll = max(0, cur_row - 1)
@@ -1349,15 +1338,12 @@ def curses_main(stdscr, sessions: list[SessionInfo],
             elif key in (curses.KEY_DOWN, ord("j")):
                 start_cursor = min(max(0, len(items) - 1), start_cursor + 1)
             elif key in (ord("\n"), curses.KEY_ENTER, 10, 13) and items:
-                ikind, obj = items[start_cursor]
-                if ikind == "cwd":
-                    return ("new", obj.cwd)  # type: ignore[union-attr]
-                if obj.attachable:  # type: ignore[union-attr]
-                    return ("attach", obj.agent_id)  # type: ignore[union-attr]
-                tty = tty_of(obj.pid)  # type: ignore[union-attr]
-                where = f" ({tty})" if tty else ""
-                flash = (f" Foreground claude in another terminal{where}: switch to that window. "
-                         "Only bg sessions can be attached. ")
+                it = items[start_cursor]
+                if isinstance(it, CwdEntry):
+                    return ("new", it.cwd)
+                if it.attachable:
+                    return ("attach", it.agent_id)
+                flash = it.hint()
             if items:
                 start_key = item_key(items[start_cursor])
             continue
@@ -1426,7 +1412,8 @@ def curses_main(stdscr, sessions: list[SessionInfo],
                            match_snippets=match_snippets if has_snippets else None,
                            current_cwd=current_cwd, live=live)
         else:
-            detail_rendered_result = draw_detail_view(stdscr, display_sessions[cursor], detail_scroll)
+            detail_rendered_result = draw_detail_view(stdscr, display_sessions[cursor],
+                                                      detail_scroll, flash)
 
         # Use get_wch in search mode for Unicode support, getch otherwise
         if mode == "list" and search_mode:
@@ -1477,6 +1464,8 @@ def curses_main(stdscr, sessions: list[SessionInfo],
             continue
 
         key = stdscr.getch()
+        if key != -1:
+            flash = ""
 
         # Ctrl+C (3) and Ctrl+D (4) always quit
         if key in (3, 4):
@@ -1534,9 +1523,12 @@ def curses_main(stdscr, sessions: list[SessionInfo],
             elif key in (ord("\n"), curses.KEY_ENTER, 10, 13):
                 s = display_sessions[cursor]
                 lx = live.by_sid.get(s.session_id) if live else None
-                if lx and lx.attachable:
-                    return ("attach", lx.agent_id)  # already running: attach, don't fork a copy
-                return ("resume", s)
+                if lx is None:
+                    return ("resume", s)
+                if lx.attachable:
+                    return ("attach", lx.agent_id)
+                # Resuming a running session forks a copy; send the user to it instead.
+                flash = lx.hint()
             elif key == curses.KEY_RESIZE:
                 pass
 
@@ -1561,15 +1553,20 @@ def _exec_claude(binary: str, cwd: str, extra_args: list[str], skip_perms: bool,
     print(f"  {' '.join(argv)}\n")
 
     os.environ.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
-    os.chdir(cwd)
+    try:
+        os.chdir(cwd)
+    except OSError as e:
+        sys.exit(f"Cannot enter {cwd_short}: {e.strerror}")
     if not background:
         os.execvp(binary, argv)
 
-    proc = subprocess.run(argv, capture_output=True, text=True)
-    out = proc.stdout + proc.stderr
-    m = re.search(r"claude attach (\S+)", out)
+    # Capture stdout only: it carries the id. stdin and stderr stay on the
+    # terminal, because claude can print progress there or ask a question
+    # (e.g. whether to install its background service).
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, text=True)
+    m = re.search(r"claude attach (\S+)", proc.stdout)
     if proc.returncode != 0 or not m:
-        sys.stderr.write(out)
+        sys.stdout.write(proc.stdout)
         sys.exit(proc.returncode or 1)
     _exec_attach(binary, m.group(1))
 
@@ -1608,7 +1605,7 @@ def main():
     )
     parser.add_argument(
         "--cwd-limit", type=int, default=10,
-        help="max cwds to list on the New tab (default: 10)",
+        help="max cwds to list on the Start screen (default: 10)",
     )
     args = parser.parse_args()
 
