@@ -2,57 +2,48 @@
 
 > The entry point to Claude Code — pick any directory, resume any session.
 
-Three tabs, one keystroke between them.
+polyclaude shows your running Claude Code sessions, starts new sessions, and resumes old sessions. It has three tabs.
 
-### New session
+### Start
 
 ```
-┌─[ New session ]─[ Resume ]─[ Settings ]──────────── Tab:switch  q:quit ─┐
-│                                                                         │
-│  Start a new Claude session in:                                         │
-│                                                                         │
-│   > ~/code/acme-api      ·  current dir  ·  12 sessions  ·  5m ago      │
-│     ~/code/acme-web      ·  47 sessions  ·  2h ago                      │
-│     ~/code/notes         ·  9 sessions   ·  1d ago                      │
-│     ~/code/sandbox       ·  3 sessions   ·  4d ago                      │
-│     ~/code/dotfiles      ·  1 session    ·  2w ago                      │
-│     ...                                                                 │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─[ Start ]─[ Resume ]─[ Settings ]─────────── Enter:attach/launch  q:quit ─┐
+│  Running                                                                  │
+│ > ● busy     fix-billing-retry   ~/code/acme-api   bg  ·  up 12m          │
+│   ● waiting  dark-mode           ~/code/acme-web   bg  ·  up 2h           │
+│   ● idle     notes               ~/code/notes      terminal  ·  up 1d     │
+│                                                                           │
+│  New session in                                                           │
+│   ~/code/acme-api      current dir  ·  1 running  ·  12 sessions  ·  5m   │
+│   ~/code/acme-web      1 running  ·  47 sessions  ·  2h ago               │
+│   ~/code/sandbox       3 sessions  ·  4d ago                              │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
+
+Enter on a running `bg` session attaches to it. Enter on a directory starts a new session there.
 
 ### Resume
 
 ```
-┌─[ New session ]─[ Resume ]─[ Settings ]──── /:search  Enter:expand  q ─┐
-│                                                                        │
-│  > 1. ~/code/acme-api                                       5m ago     │
-│       "fix flaky retry test in billing client"                         │
-│       18 msgs  ·  42 tools  ·  3 agents  ·  24m                        │
-│                                                                        │
-│    2. ~/code/acme-web                                       2h ago     │
-│       "add dark mode toggle to settings page"                          │
-│       9 msgs   ·  11 tools  ·  0 agents  ·  8m                         │
-│                                                                        │
-│    3. ~/code/notes                                          1d ago     │
-│       "summarize last week's meeting notes"                            │
-│       4 msgs   ·  2 tools   ·  0 agents  ·  3m                         │
+┌─[ Start ]─[ Resume ]─[ Settings ]────────── /:search  Enter:expand  q ─┐
+│  ── In this directory ──                                               │
+│ > ~/code/acme-api  2026-11-26 09:14:02  ● busy (bg)                    │
+│      24m  you:18  claude:40  tools:42  agents:3                        │
+│      first: fix flaky retry test in billing client                     │
+│       last: run the suite again                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Settings
 
-```
-┌─[ New session ]─[ Resume ]─[ Settings ]──── Space:toggle  Tab:switch ─┐
-│                                                                       │
-│  Settings                                                             │
-│                                                                       │
-│   > [x] Dangerously skip permissions                                  │
-│         Pass --dangerously-skip-permissions to claude.                │
-│         Disable to require per-tool approval.                         │
-│                                                                       │
-│  Saved to: ~/.config/polyclaude/config.json                           │
-└───────────────────────────────────────────────────────────────────────┘
-```
+- **Dangerously skip permissions.** Adds `--dangerously-skip-permissions`.
+- **Launch in background.** Starts sessions with `claude --bg` and attaches to them. This is the default.
+
+## Background sessions
+
+By default polyclaude starts each session with `claude --bg` and then runs `claude attach`. The Claude background service owns the session, not your terminal. Thus the session continues when the terminal or the ssh connection closes. To open it again, run `polyclaude` and select it in *Running*.
+
+A session that you started with plain `claude` is a `terminal` session. You cannot attach to it from a different terminal. Type `/bg` in that session to move it to the background.
 
 ## Install
 
@@ -71,44 +62,46 @@ Requires [uv](https://docs.astral.sh/uv/). Zero runtime deps — pure Python std
 ## Use
 
 ```sh
-polyclaude              # tabbed UI
-polyclaude 50           # 50 sessions on Resume tab (default 20)
-polyclaude --safe       # skip-permissions OFF for this run
-polyclaude -b my-claude # custom claude binary
+polyclaude              # open the UI
+polyclaude 50           # show 50 sessions on the Resume tab (default 20)
+polyclaude --fg         # start claude in the foreground for this run
+polyclaude --unsafe     # add --dangerously-skip-permissions for this run
+polyclaude -b my-claude # use a different claude binary
 ```
 
 ## Keys
 
-| Key               | Action                          |
-| ----------------- | ------------------------------- |
-| `Tab`             | cycle tabs                      |
-| `j` `k` / `↑` `↓` | navigate                        |
-| `Enter`           | launch / expand / toggle        |
-| `Space`           | toggle (Settings)               |
-| `/`               | search session text (Resume)    |
-| `Esc` / `←`       | back / clear search             |
-| `g` `G`           | top / bottom (in expanded view) |
-| `q` / `^C` / `^D` | quit                            |
+| Key               | Action                                 |
+| ----------------- | -------------------------------------- |
+| `Tab`             | go to the next tab                     |
+| `j` `k` / `↑` `↓` | move the cursor                        |
+| `Enter`           | attach / start / expand / resume       |
+| `Space`           | toggle a setting                       |
+| `/`               | search the session text (Resume)       |
+| `Esc` / `←`       | go back / clear the search             |
+| `g` `G`           | top / bottom (expanded session)        |
+| `q` / `^C` / `^D` | quit                                   |
 
 ## Config
 
-Lives at `~/.config/polyclaude/config.json`. Toggles auto-save when you flip them in the Settings tab.
+The config file is `~/.config/polyclaude/config.json`. The Settings tab saves each change immediately.
 
 ```json
 {
-  "skip_permissions": true
+  "skip_permissions": false,
+  "background": true
 }
 ```
 
 ## How it works
 
-Claude Code stores sessions as JSONL in `~/.claude/projects/<path>/<uuid>.jsonl`. polyclaude:
+Claude Code keeps each session as a JSONL file in `~/.claude/projects/<path>/<uuid>.jsonl`. polyclaude:
 
-1. Peeks the first lines of every jsonl to extract `cwd` → New tab list.
-2. Parses the N most recent sessions for stats and previews → Resume tab.
-3. On launch: `chdir` + `execvp` into `claude` — the resumed session inherits the right cwd.
-
-No background threads, no persistent index, no daemon. Just stdlib.
+1. Reads the cwd of each session file one time and caches it in `~/.cache/polyclaude/cwds.json`.
+2. Reads only the start and the last 256 KB of the recent sessions, so the screen opens fast.
+3. Counts the messages and tools on a background thread.
+4. Runs `claude agents --json` every 2 s to show the running sessions.
+5. Starts or attaches to claude with `chdir` + `execvp`.
 
 ## License
 
