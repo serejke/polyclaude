@@ -74,7 +74,7 @@ You can also set the binary with the `CLAUDE_BINARY` environment variable.
 The Start tab has two sections:
 
 - **Running** shows the sessions that run now. The sessions in the current directory are first.
-- **New session in** shows the directories from your session history. The current directory is first.
+- **New session in** shows the directories from your session history. The current directory is first, and the cursor starts on it, so Enter starts a new session there.
 
 ### Resume
 

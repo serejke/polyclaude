@@ -1350,7 +1350,9 @@ def curses_main(stdscr, sessions: list[SessionInfo],
 
     # Start tab state
     start_cursor = 0
-    start_key: str | None = None
+    # Start on the current directory (pinned first in cwd_entries), not on the
+    # first running session: a new session there is the common action.
+    start_key: str | None = item_key(cwd_entries[0]) if cwd_entries else None
     start_scroll = 0
     flash = ""
 
