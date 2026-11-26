@@ -6,8 +6,8 @@ Usage:
     polyclaude [--binary NAME] [--unsafe] [--fg] [--cwd-limit N] [count]
 
 Tabs:
-    New session  - launch claude in a recent cwd (current dir pinned)
-    Running      - live sessions from `claude agents --json`; Enter attaches (bg only)
+    Start        - running sessions (Enter attaches, bg only), then recent cwds
+                   (Enter starts a new session; current dir pinned)
     Resume       - pick from recent sessions; expand and resume
     Settings     - toggle persistent options (e.g. skip-permissions)
 
@@ -151,6 +151,7 @@ class LiveSession:
     agent_id: str = ""   # background only: the id `claude attach` takes
     name: str = ""
     started_epoch: float = 0.0
+    pid: int = 0
 
     @property
     def attachable(self) -> bool:
@@ -180,6 +181,7 @@ def fetch_live_sessions(binary: str) -> list[LiveSession] | None:
             agent_id=a.get("id") or "",
             name=a.get("name") or "",
             started_epoch=(a.get("startedAt") or 0) / 1000,
+            pid=int(a.get("pid") or 0),
         ))
     return live
 
@@ -875,8 +877,8 @@ def safe_addstr(win, y, x, text, attr=0):
         pass
 
 
-TAB_LABELS = (" New session ", " Running ", " Resume ", " Settings ")
-TAB_NEW, TAB_RUNNING, TAB_RESUME, TAB_SETTINGS = range(4)
+TAB_LABELS = (" Start ", " Resume ", " Settings ")
+TAB_START, TAB_RESUME, TAB_SETTINGS = range(3)
 
 
 def draw_tab_bar(stdscr, active_tab: int, help_text: str = ""):
@@ -894,58 +896,6 @@ def draw_tab_bar(stdscr, active_tab: int, help_text: str = ""):
         help_text = " Tab:switch  q:quit "
     safe_addstr(stdscr, 0, max(x + 2, w - len(help_text) - 2),
                 help_text, curses.color_pair(C_HEADER))
-
-
-def draw_new_tab_view(stdscr, entries: list[CwdEntry], cursor: int, scroll: int,
-                      current_cwd: str, live: "LivePoller | None" = None):
-    h, w = stdscr.getmaxyx()
-    stdscr.erase()
-    draw_tab_bar(stdscr, active_tab=TAB_NEW,
-                 help_text=" Tab:switch  Enter:launch  q:quit ")
-
-    safe_addstr(stdscr, 2, 2, "Start a new Claude session in:",
-                curses.color_pair(C_LABEL) | curses.A_BOLD)
-
-    if not entries:
-        safe_addstr(stdscr, 4, 2, "(no directories found in session history)",
-                    curses.A_DIM)
-    else:
-        y = 4
-        for i in range(scroll, len(entries)):
-            if y >= h - 1:
-                break
-            e = entries[i]
-            is_sel = i == cursor
-            cwd_short = e.cwd.replace(HOME, "~")
-            marker = " > " if is_sel else "   "
-
-            attr_marker = curses.color_pair(C_IDX) | curses.A_BOLD if is_sel else 0
-            attr_path = curses.color_pair(C_PATH) | curses.A_BOLD
-            safe_addstr(stdscr, y, 0, marker, attr_marker)
-            safe_addstr(stdscr, y, len(marker), cwd_short, attr_path)
-
-            parts = []
-            if e.cwd == current_cwd:
-                parts.append("current dir")
-            n_live = live.running_in(e.cwd) if live else 0
-            if n_live:
-                parts.append(f"{n_live} running")
-            if e.session_count > 0:
-                parts.append(f"{e.session_count} session{'s' if e.session_count != 1 else ''}")
-            rel = human_relative_time(e.last_used_epoch)
-            if rel:
-                parts.append(rel)
-            stats = "  ·  ".join(parts)
-            x_stats = len(marker) + len(cwd_short) + 3
-            safe_addstr(stdscr, y, x_stats, stats, curses.A_DIM)
-            y += 1
-
-    safe_addstr(stdscr, h - 1, 0, " " * w, curses.A_DIM)
-    safe_addstr(stdscr, h - 1, 2,
-                f" {len(entries)} dirs  ·  cursor: {cursor + 1}/{max(1, len(entries))}  ·  Enter to launch ",
-                curses.A_DIM)
-
-    stdscr.refresh()
 
 
 def draw_settings_view(stdscr, cfg: Config, cursor: int):
@@ -1002,52 +952,106 @@ def status_attr(status: str) -> int:
     return curses.A_DIM
 
 
-def draw_running_view(stdscr, live: list[LiveSession], cursor: int, scroll: int,
-                      poller: "LivePoller", current_cwd: str, flash: str = ""):
+def tty_of(pid: int) -> str:
+    """Controlling terminal of a process (e.g. "ttys009"), or "" if unknown."""
+    try:
+        out = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "" if out in ("", "?", "??") else out
+
+
+# A Start-screen item: ("live", LiveSession) or ("cwd", CwdEntry).
+StartItem = tuple[str, object]
+
+
+def start_items(live: list[LiveSession], entries: list[CwdEntry]) -> list[StartItem]:
+    return [("live", x) for x in live] + [("cwd", e) for e in entries]
+
+
+def item_key(item: StartItem) -> tuple[str, str]:
+    """Stable identity, so the cursor stays on the same row when the live list refreshes."""
+    kind, obj = item
+    return (kind, obj.session_id if kind == "live" else obj.cwd)  # type: ignore[union-attr]
+
+
+def start_rows(items: list[StartItem], poller: "LivePoller | None") -> list[tuple[str, int]]:
+    """Screen rows as (kind, item index); kind is "item", "header:<text>" or "blank"."""
+    rows: list[tuple[str, int]] = []
+    n_live = sum(1 for k, _ in items if k == "live")
+    rows.append(("header:Running", -1))
+    if n_live == 0:
+        loaded = poller is not None and poller.loaded
+        rows.append(("note:" + ("(nothing running)" if loaded else "loading…"), -1))
+    for i in range(n_live):
+        rows.append(("item", i))
+    rows.append(("blank", -1))
+    rows.append(("header:New session in", -1))
+    for i in range(n_live, len(items)):
+        rows.append(("item", i))
+    return rows
+
+
+def draw_start_view(stdscr, items: list[StartItem], rows: list[tuple[str, int]],
+                    cursor: int, scroll: int, current_cwd: str,
+                    poller: "LivePoller | None", flash: str = ""):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
-    draw_tab_bar(stdscr, active_tab=TAB_RUNNING,
-                 help_text=" Tab:switch  Enter:attach  q:quit ")
-    safe_addstr(stdscr, 2, 2, "Running sessions:", curses.color_pair(C_LABEL) | curses.A_BOLD)
+    draw_tab_bar(stdscr, active_tab=TAB_START,
+                 help_text=" Tab:switch  Enter:attach/launch  q:quit ")
 
-    if not poller.loaded:
-        safe_addstr(stdscr, 4, 2, "loading…", curses.A_DIM)
-    elif poller.error and not live:
-        safe_addstr(stdscr, 4, 2, "could not run `claude agents --json`", curses.color_pair(C_LABEL))
-    elif not live:
-        safe_addstr(stdscr, 4, 2, "(nothing running)", curses.A_DIM)
-
-    y = 4
-    for i in range(scroll, len(live)):
-        if y >= h - 2:
+    y = 2
+    for kind, idx in rows[scroll:]:
+        if y >= h - 1:
             break
-        x = live[i]
-        is_sel = i == cursor
-        marker = " > " if is_sel else "   "
-        dot_attr = status_attr(x.status)
-        title = x.name or x.session_id[:8]
-        cwd_short = x.cwd.replace(HOME, "~")
-        kind = "bg" if x.kind == "background" else "terminal"
-        meta = [kind]
-        if x.state and x.state != x.status:
-            meta.append(x.state)
-        age = human_relative_time(x.started_epoch).replace(" ago", "")
-        if age:
-            meta.append(f"up {age}")
-
-        safe_addstr(stdscr, y, 0, marker, curses.color_pair(C_IDX) | curses.A_BOLD if is_sel else 0)
-        safe_addstr(stdscr, y, 3, "●", dot_attr)
-        safe_addstr(stdscr, y, 5, x.status, dot_attr)
-        safe_addstr(stdscr, y, 14, title, curses.color_pair(C_TITLE) | curses.A_BOLD)
+        if kind.startswith("header:"):
+            safe_addstr(stdscr, y, 2, kind[7:], curses.color_pair(C_LABEL) | curses.A_BOLD)
+        elif kind.startswith("note:"):
+            safe_addstr(stdscr, y, 5, kind[5:], curses.A_DIM)
+        elif kind == "item":
+            ikind, obj = items[idx]
+            is_sel = idx == cursor
+            marker = " > " if is_sel else "   "
+            safe_addstr(stdscr, y, 0, marker, curses.color_pair(C_IDX) | curses.A_BOLD if is_sel else 0)
+            if ikind == "live":
+                x: LiveSession = obj  # type: ignore[assignment]
+                attr = status_attr(x.status)
+                safe_addstr(stdscr, y, 3, "●", attr)
+                safe_addstr(stdscr, y, 5, x.status, attr)
+                title = truncate(x.name or x.session_id[:8], 40)
+                safe_addstr(stdscr, y, 14, title, curses.color_pair(C_TITLE) | curses.A_BOLD)
+                cx = 14 + max(len(title), 20) + 2
+                cwd_short = x.cwd.replace(HOME, "~")
+                safe_addstr(stdscr, y, cx, cwd_short, curses.color_pair(C_PATH))
+                meta = ["bg" if x.kind == "background" else "terminal"]
+                if x.state and x.state != x.status:
+                    meta.append(x.state)
+                age = human_relative_time(x.started_epoch).replace(" ago", "")
+                if age:
+                    meta.append(f"up {age}")
+                safe_addstr(stdscr, y, cx + len(cwd_short) + 3, "  ·  ".join(meta), curses.A_DIM)
+            else:
+                e: CwdEntry = obj  # type: ignore[assignment]
+                cwd_short = e.cwd.replace(HOME, "~")
+                safe_addstr(stdscr, y, 3, cwd_short, curses.color_pair(C_PATH) | curses.A_BOLD)
+                parts = []
+                if e.cwd == current_cwd:
+                    parts.append("current dir")
+                n_live = poller.running_in(e.cwd) if poller else 0
+                if n_live:
+                    parts.append(f"{n_live} running")
+                if e.session_count > 0:
+                    parts.append(f"{e.session_count} session{'s' if e.session_count != 1 else ''}")
+                rel = human_relative_time(e.last_used_epoch)
+                if rel:
+                    parts.append(rel)
+                safe_addstr(stdscr, y, 3 + len(cwd_short) + 3, "  ·  ".join(parts), curses.A_DIM)
         y += 1
-        safe_addstr(stdscr, y, 14, cwd_short, curses.color_pair(C_PATH))
-        safe_addstr(stdscr, y, 14 + len(cwd_short) + 2, "  ·  ".join(meta), curses.A_DIM)
-        y += 2
 
     safe_addstr(stdscr, h - 1, 0, " " * w, curses.A_DIM)
-    footer = flash or (f" {len(live)} running  ·  Enter attaches to bg sessions; "
-                       "terminal ones live in another terminal ")
-    safe_addstr(stdscr, h - 1, 2, footer, curses.A_DIM)
+    footer = flash or " Enter: attach to a running bg session, or start a new one in a directory "
+    safe_addstr(stdscr, h - 1, 2, footer, curses.color_pair(C_LABEL) if flash else curses.A_DIM)
     stdscr.refresh()
 
 
@@ -1270,16 +1274,13 @@ def curses_main(stdscr, sessions: list[SessionInfo],
     curses.curs_set(0)
     init_colors()
 
-    active_tab = TAB_NEW if cwd_entries else TAB_RESUME
+    active_tab = TAB_START
 
-    # Running tab state
-    run_cursor = 0
-    run_scroll = 0
+    # Start tab state
+    start_cursor = 0
+    start_key: tuple[str, str] | None = None
+    start_scroll = 0
     flash = ""
-
-    # New tab state
-    new_cursor = 0
-    new_scroll = 0
 
     # Settings tab state
     settings_cursor = 0
@@ -1316,16 +1317,24 @@ def curses_main(stdscr, sessions: list[SessionInfo],
         has_snippets = filtered_sessions is not None
         ITEM_HEIGHT = 5  # base height without snippets
 
-        # ── Running tab ──────────────────────────────────────────────────
-        if active_tab == TAB_RUNNING:
+        # ── Start tab: running sessions, then directories for a new one ──
+        if active_tab == TAB_START:
             running = sort_live(live.sessions, current_cwd) if live else []
-            run_cursor = min(run_cursor, max(0, len(running) - 1))
-            usable = max(1, (h - 6) // 3)
-            if run_cursor < run_scroll:
-                run_scroll = run_cursor
-            if run_cursor >= run_scroll + usable:
-                run_scroll = run_cursor - usable + 1
-            draw_running_view(stdscr, running, run_cursor, run_scroll, live, current_cwd, flash)
+            items = start_items(running, cwd_entries)
+            rows = start_rows(items, live)
+            # Follow the selected item by identity across live-list refreshes.
+            keys = [item_key(it) for it in items]
+            start_cursor = keys.index(start_key) if start_key in keys else \
+                min(start_cursor, max(0, len(items) - 1))
+            row_of = {idx: r for r, (k, idx) in enumerate(rows) if k == "item"}
+            cur_row = row_of.get(start_cursor, 0)
+            usable = h - 3
+            if cur_row - 1 < start_scroll:   # keep the section header above visible
+                start_scroll = max(0, cur_row - 1)
+            if cur_row >= start_scroll + usable:
+                start_scroll = cur_row - usable + 1
+            draw_start_view(stdscr, items, rows, start_cursor, start_scroll,
+                            current_cwd, live, flash)
 
             key = stdscr.getch()
             if key == -1:
@@ -1336,43 +1345,21 @@ def curses_main(stdscr, sessions: list[SessionInfo],
             if key == 9:
                 active_tab = (active_tab + 1) % len(TAB_LABELS)
             elif key in (curses.KEY_UP, ord("k")):
-                run_cursor = max(0, run_cursor - 1)
+                start_cursor = max(0, start_cursor - 1)
             elif key in (curses.KEY_DOWN, ord("j")):
-                run_cursor = min(max(0, len(running) - 1), run_cursor + 1)
-            elif key in (ord("\n"), curses.KEY_ENTER, 10, 13) and running:
-                x = running[run_cursor]
-                if x.attachable:
-                    return ("attach", x.agent_id)
-                flash = " This session belongs to another terminal; only bg sessions can be attached. "
-            continue
-
-        # ── New tab ──────────────────────────────────────────────────────
-        if active_tab == TAB_NEW:
-            usable = h - 5  # tab bar + heading + footer + margins
-            if new_cursor < new_scroll:
-                new_scroll = new_cursor
-            if new_cursor >= new_scroll + usable:
-                new_scroll = new_cursor - usable + 1
-
-            draw_new_tab_view(stdscr, cwd_entries, new_cursor, new_scroll, current_cwd, live)
-
-            key = stdscr.getch()
-            if key in (3, 4):
-                return None
-            if key == 9:  # Tab
-                active_tab = (active_tab + 1) % len(TAB_LABELS)
-                continue
-            if key in (ord("q"), ord("Q")):
-                return None
-            if key in (curses.KEY_UP, ord("k")):
-                new_cursor = max(0, new_cursor - 1)
-            elif key in (curses.KEY_DOWN, ord("j")):
-                new_cursor = min(max(0, len(cwd_entries) - 1), new_cursor + 1)
-            elif key in (ord("\n"), curses.KEY_ENTER, 10, 13):
-                if cwd_entries:
-                    return ("new", cwd_entries[new_cursor].cwd)
-            elif key == curses.KEY_RESIZE:
-                pass
+                start_cursor = min(max(0, len(items) - 1), start_cursor + 1)
+            elif key in (ord("\n"), curses.KEY_ENTER, 10, 13) and items:
+                ikind, obj = items[start_cursor]
+                if ikind == "cwd":
+                    return ("new", obj.cwd)  # type: ignore[union-attr]
+                if obj.attachable:  # type: ignore[union-attr]
+                    return ("attach", obj.agent_id)  # type: ignore[union-attr]
+                tty = tty_of(obj.pid)  # type: ignore[union-attr]
+                where = f" ({tty})" if tty else ""
+                flash = (f" Foreground claude in another terminal{where}: switch to that window. "
+                         "Only bg sessions can be attached. ")
+            if items:
+                start_key = item_key(items[start_cursor])
             continue
 
         # ── Settings tab ─────────────────────────────────────────────────

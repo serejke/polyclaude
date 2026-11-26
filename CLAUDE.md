@@ -17,12 +17,11 @@ Single-file architecture — everything lives in `main.py`. No runtime dependenc
 
 ## Tabs
 
-- **New session** (tab 0): list of cwds extracted from session history, current dir pinned at top. Enter launches `claude` (with `--dangerously-skip-permissions` per config).
-- **Running** (tab 1): live sessions from `claude agents --json` (polled every 2 s by `LivePoller` on a daemon thread): status (busy / waiting / idle), name, cwd, kind. Enter attaches to a background session; interactive ones belong to another terminal and can't be attached.
-- **Resume** (tab 2): existing picker. `/` to search session text, Enter to expand, Enter again to resume. Rows of running sessions carry a `● status (kind)` marker; Enter on a running background session attaches instead of resuming a copy.
-- **Settings** (tab 3): list of toggles. Space/Enter toggles; saved immediately to `~/.config/polyclaude/config.json`.
+- **Start** (tab 0): one screen, two sections. *Running*: live sessions from `claude agents --json` (polled every 2 s by `LivePoller` on a daemon thread) with status (busy / waiting / idle), name, cwd, kind; Enter attaches to a background session. Interactive (`terminal`) sessions are foreground `claude` processes owned by another terminal: they can't be attached, and Enter names their tty instead. *New session in*: cwds from session history, current dir pinned, with a running count; Enter launches `claude`. The cursor follows the selected item by identity (`item_key`) across live-list refreshes.
+- **Resume** (tab 1): existing picker. `/` to search session text, Enter to expand, Enter again to resume. Rows of running sessions carry a `● status (kind)` marker; Enter on a running background session attaches instead of resuming a copy.
+- **Settings** (tab 2): list of toggles. Space/Enter toggles; saved immediately to `~/.config/polyclaude/config.json`.
 
-`Tab` cycles 0 → 1 → 2 → 3 → 0. Tab indices are the `TAB_*` constants. The New tab also shows how many sessions run in each cwd.
+`Tab` cycles 0 → 1 → 2 → 0. Tab indices are the `TAB_*` constants.
 
 ## Key design decisions
 
