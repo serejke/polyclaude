@@ -3,7 +3,7 @@
 polyclaude — the entry point to Claude Code: pick any directory, resume any session.
 
 Usage:
-    polyclaude [--binary NAME] [--unsafe] [--cwd-limit N] [count]
+    polyclaude [--binary NAME] [--unsafe] [--fg] [--cwd-limit N] [count]
 
 Tabs:
     New session  - launch claude in a recent cwd (current dir pinned)
@@ -25,6 +25,8 @@ import curses
 import json
 import locale
 import os
+import re
+import subprocess
 import sys
 import textwrap
 import threading
@@ -54,6 +56,7 @@ CWD_CACHE_PATH = CACHE_DIR / "cwds.json"
 @dataclass
 class Config:
     skip_permissions: bool = False
+    background: bool = True
 
 
 def load_config() -> Config:
@@ -62,14 +65,18 @@ def load_config() -> Config:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return Config()
-    return Config(skip_permissions=bool(data.get("skip_permissions", False)))
+    return Config(
+        skip_permissions=bool(data.get("skip_permissions", False)),
+        background=bool(data.get("background", True)),
+    )
 
 
 def save_config(cfg: Config) -> None:
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_PATH, "w") as f:
-            json.dump({"skip_permissions": cfg.skip_permissions}, f, indent=2)
+            json.dump({"skip_permissions": cfg.skip_permissions,
+                       "background": cfg.background}, f, indent=2)
     except OSError:
         pass
 
@@ -79,6 +86,13 @@ SETTINGS_ITEMS: list[tuple[str, str, str]] = [
         "skip_permissions",
         "Dangerously skip permissions",
         "Pass --dangerously-skip-permissions to claude. Disable to require per-tool approval.",
+    ),
+    (
+        "background",
+        "Launch in background",
+        "Start sessions with `claude --bg`, then `claude attach` to them. The session is owned by "
+        "Claude's background host, not this terminal, so it keeps running if the terminal or ssh "
+        "drops. In attach, Left returns to agent view, Ctrl+Z to the shell.",
     ),
 ]
 
@@ -1344,9 +1358,18 @@ def curses_main(stdscr, sessions: list[SessionInfo],
                 pass
 
 
-def _exec_claude(binary: str, cwd: str, extra_args: list[str], skip_perms: bool):
+def _exec_claude(binary: str, cwd: str, extra_args: list[str], skip_perms: bool,
+                 background: bool = False):
+    """Replace this process with claude in `cwd`.
+
+    Foreground: claude itself, a child of this terminal (dies with it).
+    Background: `claude --bg` hands the session to Claude's background host and
+    prints its id; we then exec `claude attach <id>`, a detachable viewer.
+    """
     cwd_short = cwd.replace(HOME, "~")
     argv = [binary]
+    if background:
+        argv.append("--bg")
     if skip_perms:
         argv.append("--dangerously-skip-permissions")
     argv.extend(extra_args)
@@ -1356,6 +1379,21 @@ def _exec_claude(binary: str, cwd: str, extra_args: list[str], skip_perms: bool)
 
     os.environ.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
     os.chdir(cwd)
+    if not background:
+        os.execvp(binary, argv)
+
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    out = proc.stdout + proc.stderr
+    m = re.search(r"claude attach (\S+)", out)
+    if proc.returncode != 0 or not m:
+        sys.stderr.write(out)
+        sys.exit(proc.returncode or 1)
+    _exec_attach(binary, m.group(1))
+
+
+def _exec_attach(binary: str, agent_id: str):
+    argv = [binary, "attach", agent_id]
+    print(f"  {' '.join(argv)}\n")
     os.execvp(binary, argv)
 
 
@@ -1380,6 +1418,10 @@ def main():
     parser.add_argument(
         "--unsafe", action="store_true",
         help="force --dangerously-skip-permissions ON for this run (overrides config)",
+    )
+    parser.add_argument(
+        "--fg", action="store_true",
+        help="launch in the foreground for this run (overrides the background setting)",
     )
     parser.add_argument(
         "--cwd-limit", type=int, default=10,
@@ -1408,15 +1450,17 @@ def main():
         sys.exit(0)
 
     skip_perms = cfg.skip_permissions or args.unsafe
+    background = cfg.background and not args.fg
     kind, payload = action
 
     if kind == "new":
-        _exec_claude(args.binary, cwd=payload, extra_args=[], skip_perms=skip_perms)
+        _exec_claude(args.binary, cwd=payload, extra_args=[], skip_perms=skip_perms,
+                     background=background)
     elif kind == "resume":
         session = payload  # type: SessionInfo
         _exec_claude(args.binary, cwd=session.cwd,
                      extra_args=["--resume", session.session_id],
-                     skip_perms=skip_perms)
+                     skip_perms=skip_perms, background=background)
     else:
         sys.exit(0)
 

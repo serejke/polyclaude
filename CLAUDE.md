@@ -33,7 +33,8 @@ Single-file architecture — everything lives in `main.py`. No runtime dependenc
 - **Cached cwd peek**: New tab needs the `cwd` of every session jsonl. It reads the first ~5 lines of a file once and caches `{path: cwd}` in `~/.cache/polyclaude/cwds.json` (XDG-aware via `XDG_CACHE_HOME`). A session's cwd never changes, so entries need no invalidation; only new files are opened. Files with no cwd yet are not cached.
 - **Binary configurable**: `--binary` flag or `CLAUDE_BINARY` env var. Defaults to `claude`.
 - **exec-based launch**: uses `os.execvp` after `os.chdir` — replaces the process entirely, so the resumed Claude session inherits the correct cwd.
-- **Persistent config** at `~/.config/polyclaude/config.json` (XDG-aware via `XDG_CONFIG_HOME`). Schema: `{"skip_permissions": bool}`. Defaults to `false` (permissions enforced); toggles auto-save. Enable in config/Settings to skip permission prompts.
+- **Background launch (default)**: with `background` on, polyclaude runs `claude --bg [--resume <id>]` in the cwd, parses the id from its `claude attach <id>` hint, then execs `claude attach <id>`. The session lives in Claude's background host, not under this terminal, so it survives ssh drops; `attach` is only a viewer. `--fg` forces the old foreground exec for one run.
+- **Persistent config** at `~/.config/polyclaude/config.json` (XDG-aware via `XDG_CONFIG_HOME`). Schema: `{"skip_permissions": bool, "background": bool}`. `skip_permissions` defaults to `false` (permissions enforced), `background` to `true`; toggles auto-save. Enable in config/Settings to skip permission prompts.
 - **`--unsafe` CLI flag** forces `--dangerously-skip-permissions` ON for one run, regardless of config.
 
 ## Session data format
