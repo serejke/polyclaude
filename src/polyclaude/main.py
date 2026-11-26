@@ -132,6 +132,7 @@ class SessionInfo:
     raw_content: str = ""
     raw_loaded: bool = False    # raw_content is read on the first search
     last_epoch: float = 0.0     # last activity; the Resume list sorts by it
+    last_reply: str = ""        # last text answer of the main agent
 
 
 @dataclass
@@ -263,6 +264,17 @@ NOISE_PREFIXES = ("<local-command-", "<command-name>", "<command-message>",
 def is_noise(text: str) -> bool:
     """Text that Claude Code injects into a user turn, not text a person typed."""
     return not text or text.startswith(NOISE_PREFIXES)
+
+
+def assistant_text(obj: dict) -> str | None:
+    """Text of a main-agent answer (not a sub-agent), or None."""
+    if obj.get("type") != "assistant" or obj.get("isSidechain") or obj.get("agentId"):
+        return None
+    content = obj.get("message", {}).get("content", "")
+    if isinstance(content, str):
+        return content.strip() or None
+    text = extract_text(content)
+    return text or None
 
 
 def human_user_text(obj: dict) -> str | None:
@@ -429,6 +441,7 @@ def collect_recent_cwds(limit: int, current_cwd: str | None) -> list[CwdEntry]:
 def parse_session(jsonl_path: Path, load_messages: bool = False) -> SessionInfo | None:
     first_user = last_user = session_id = cwd = ts_first = ts_last = None
     custom_title = ""
+    last_reply = ""
     messages: list[ChatMessage] = []
     first_ts_epoch = 0.0
     last_ts_epoch = 0.0
@@ -512,6 +525,9 @@ def parse_session(jsonl_path: Path, load_messages: bool = False) -> SessionInfo 
                         text = str(content).strip()
 
                     n_assistant += 1
+                    reply = assistant_text(obj)
+                    if reply:
+                        last_reply = reply
 
                     if text and load_messages:
                         messages.append(ChatMessage(
@@ -547,6 +563,7 @@ def parse_session(jsonl_path: Path, load_messages: bool = False) -> SessionInfo 
         duration_min=duration,
         messages=messages,
         messages_loaded=load_messages,
+        last_reply=last_reply,
     )
 
 
@@ -610,10 +627,12 @@ def scan_session_meta(jsonl_path: Path) -> SessionInfo | None:
     # ts_last is the last activity in the file. last_user is the last human
     # message; when long tool output pushes it out of the tail, Claude Code's
     # periodically re-appended "last-prompt" line still carries it.
-    last_user = ts_last = None
+    last_user = ts_last = last_reply = None
     last_prompt = None
     name = ""
     for obj in reversed(list(_json_lines(tail))):
+        if last_reply is None:
+            last_reply = assistant_text(obj)
         if ts_last is None and obj.get("timestamp"):
             ts_last = obj["timestamp"]
         otype = obj.get("type")
@@ -627,7 +646,7 @@ def scan_session_meta(jsonl_path: Path) -> SessionInfo | None:
                 last_prompt = lp.strip()
         if last_user is None:
             last_user = human_user_text(obj)
-        if name and last_user is not None and ts_last is not None:
+        if name and last_user is not None and ts_last is not None and last_reply is not None:
             break
     last_user = last_user or last_prompt
 
@@ -642,6 +661,7 @@ def scan_session_meta(jsonl_path: Path) -> SessionInfo | None:
         timestamp_first=ts_first or "",
         timestamp_last=ts_last or ts_first or "",
         last_epoch=parse_ts_epoch(ts_last or "") or mtime,
+        last_reply=last_reply or "",
     )
 
 
@@ -657,6 +677,7 @@ def load_stats(session: SessionInfo) -> None:
         session.tool_uses = full.tool_uses
         session.duration_min = full.duration_min
         session.last_user_msg = full.last_user_msg  # authoritative over the tail guess
+        session.last_reply = full.last_reply or session.last_reply
         if full.name:
             session.name = full.name
     session.stats_loaded = True
@@ -913,6 +934,37 @@ TAB_LABELS = (" Start ", " Resume ", " Settings ")
 TAB_START, TAB_RESUME, TAB_SETTINGS = range(3)
 
 
+def tab_at(x: int) -> int | None:
+    """Tab under column `x` of the tab bar (the layout of draw_tab_bar)."""
+    left = 2
+    for i, label in enumerate(TAB_LABELS):
+        if left <= x < left + len(label):
+            return i
+        left += len(label) + 1
+    return None
+
+
+WHEEL_UP = curses.BUTTON4_PRESSED
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0)
+
+
+def read_mouse() -> tuple[int, int, str] | None:
+    """(x, y, event) for a KEY_MOUSE; event is "click", "double", "up" or "down"."""
+    try:
+        _, x, y, _, b = curses.getmouse()
+    except curses.error:
+        return None
+    if b & curses.BUTTON1_DOUBLE_CLICKED:
+        return x, y, "double"
+    if b & curses.BUTTON1_CLICKED:
+        return x, y, "click"
+    if b & WHEEL_UP:
+        return x, y, "up"
+    if WHEEL_DOWN and b & WHEEL_DOWN:
+        return x, y, "down"
+    return None
+
+
 def draw_tab_bar(stdscr, active_tab: int, help_text: str = ""):
     h, w = stdscr.getmaxyx()
     safe_addstr(stdscr, 0, 0, " " * w, curses.color_pair(C_HEADER))
@@ -1002,8 +1054,10 @@ def start_rows(items: list[StartItem], loaded: bool) -> list[int | str]:
 
 def draw_start_view(stdscr, items: list[StartItem], rows: list[int | str],
                     cursor: int, scroll: int, current_cwd: str,
-                    poller: "LivePoller | None", flash: str = ""):
+                    poller: "LivePoller | None", flash: str = "") -> dict[int, int]:
+    """Draw the Start screen. Returns {screen row: item index}."""
     h, w = stdscr.getmaxyx()
+    hits: dict[int, int] = {}
     stdscr.erase()
     draw_tab_bar(stdscr, active_tab=TAB_START,
                  help_text=" Tab:switch  Enter:attach/launch  q:quit ")
@@ -1018,6 +1072,7 @@ def draw_start_view(stdscr, items: list[StartItem], rows: list[int | str],
             else:
                 safe_addstr(stdscr, y, 5, row, curses.A_DIM)
         else:
+            hits[y] = row
             x = items[row]
             is_sel = row == cursor
             marker = " > " if is_sel else "   "
@@ -1060,6 +1115,7 @@ def draw_start_view(stdscr, items: list[StartItem], rows: list[int | str],
     footer = flash or " Enter: attach to a running bg session, or start a new one in a directory "
     safe_addstr(stdscr, h - 1, 2, footer, curses.color_pair(C_LABEL) if flash else curses.A_DIM)
     stdscr.refresh()
+    return hits
 
 
 COL = 13  # Resume rows: time in columns 3-12, everything else from here
@@ -1068,6 +1124,8 @@ COL = 13  # Resume rows: time in columns 3-12, everything else from here
 def session_height(s: SessionInfo, match_snippets: dict | None) -> int:
     """Rows that draw_session_rows uses, plus one blank separator row."""
     n = 4 if s.first_user_msg != s.last_user_msg else 3
+    if s.last_reply:
+        n += 1
     if match_snippets is not None:
         n += len(match_snippets.get(s.session_id, []))
     return n + 1
@@ -1078,7 +1136,8 @@ def draw_session_rows(stdscr, y: int, w: int, s: SessionInfo, cwd_short: str,
     """  5m ago   name-or-path            ● busy (bg)
                 ~/path  24m  you:18  claude:40  tools:42
                 first: ...
-                 last: ...                                """
+                 last: ...
+                reply: ...                                """
     safe_addstr(stdscr, y, 3, when_label(s.last_epoch), curses.color_pair(C_IDX))
     title, title_attr = (s.name, curses.color_pair(C_TITLE) | curses.A_BOLD) if s.name \
         else (cwd_short, curses.color_pair(C_PATH) | curses.A_BOLD)
@@ -1103,20 +1162,23 @@ def draw_session_rows(stdscr, y: int, w: int, s: SessionInfo, cwd_short: str,
         x += len(cwd_short) + 2
     safe_addstr(stdscr, y + 1, x, stats, curses.A_DIM)
 
-    lines = [("first:", s.first_user_msg, 0)]
+    text_attr = curses.color_pair(C_TEXT)
+    lines = [("first:", s.first_user_msg, text_attr)]
     if s.first_user_msg != s.last_user_msg:
-        lines.append((" last:", s.last_user_msg, 0))
-    lines += [("match:", sn, curses.A_BOLD) for sn in snippets]
-    for i, (label, text, extra) in enumerate(lines):
+        lines.append((" last:", s.last_user_msg, text_attr))
+    if s.last_reply:
+        lines.append(("reply:", s.last_reply, curses.A_DIM))
+    lines += [("match:", sn, text_attr | curses.A_BOLD) for sn in snippets]
+    for i, (label, text, attr) in enumerate(lines):
         safe_addstr(stdscr, y + 2 + i, COL, label, curses.color_pair(C_LABEL))
-        safe_addstr(stdscr, y + 2 + i, COL + 7, truncate(text, max(10, w - COL - 10)),
-                    curses.color_pair(C_TEXT) | extra)
+        safe_addstr(stdscr, y + 2 + i, COL + 7, truncate(text, max(10, w - COL - 10)), attr)
 
 
 def draw_list_view(stdscr, sessions: list[SessionInfo], cursor: int, scroll: int,
                    search_mode: bool = False, search_query: str = "",
                    active_query: str = "", match_snippets: dict | None = None,
-                   current_cwd: str = "", live: "LivePoller | None" = None):
+                   current_cwd: str = "", live: "LivePoller | None" = None) -> dict[int, int]:
+    """Draw the Resume list. Returns {screen row: session index}."""
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
@@ -1132,6 +1194,7 @@ def draw_list_view(stdscr, sessions: list[SessionInfo], cursor: int, scroll: int
 
     has_snippets = match_snippets is not None
     in_search = bool(active_query)
+    hits: dict[int, int] = {}  # screen row -> session index, for mouse clicks
     y = 2
 
     if not sessions and active_query:
@@ -1162,7 +1225,10 @@ def draw_list_view(stdscr, sessions: list[SessionInfo], cursor: int, scroll: int
             draw_session_rows(stdscr, y, w, s, cwd_short,
                               live.by_sid.get(s.session_id) if live else None,
                               match_snippets.get(s.session_id, []) if has_snippets else [])
-            y += session_height(s, match_snippets if has_snippets else None)
+            height = session_height(s, match_snippets if has_snippets else None)
+            for r in range(y, y + height - 1):
+                hits[r] = i
+            y += height
 
     # Footer / search input
     safe_addstr(stdscr, h - 1, 0, " " * w, curses.color_pair(C_HEADER) if search_mode else curses.A_DIM)
@@ -1177,6 +1243,7 @@ def draw_list_view(stdscr, sessions: list[SessionInfo], cursor: int, scroll: int
         safe_addstr(stdscr, h - 1, 2, footer, curses.A_DIM)
 
     stdscr.refresh()
+    return hits
 
 
 def wrap_text(text: str, width: int) -> list[str]:
@@ -1233,8 +1300,8 @@ def draw_detail_view(stdscr, session: SessionInfo, scroll: int, flash: str = "")
 
         # Wrap message text, cap at ~20 lines per message for readability
         lines = wrap_text(msg.text, content_width)
-        if len(lines) > 20:
-            lines = lines[:19] + [f"  ... ({len(lines) - 19} more lines)"]
+        if len(lines) > 40:
+            lines = lines[:39] + [f"  ... ({len(lines) - 39} more lines)"]
         for ln in lines:
             rendered.append((f"    {ln}", text_attr))
 
@@ -1243,6 +1310,7 @@ def draw_detail_view(stdscr, session: SessionInfo, scroll: int, flash: str = "")
     # Draw with scroll
     y = 3
     total_lines = len(rendered)
+    scroll = min(scroll, max(0, total_lines - (h - 4)))  # callers may pass "bottom" as a huge value
     for i in range(scroll, total_lines):
         if y >= h - 1:
             break
@@ -1269,8 +1337,12 @@ def curses_main(stdscr, sessions: list[SessionInfo],
     """Returns ("new", cwd) | ("resume", SessionInfo) | ("attach", agent_id) | None."""
     curses.curs_set(0)
     init_colors()
+    curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
+                     | WHEEL_UP | WHEEL_DOWN)
 
     active_tab = TAB_START
+
+    list_hits: dict[int, int] = {}
 
     # Start tab state
     start_cursor = 0
@@ -1326,13 +1398,26 @@ def curses_main(stdscr, sessions: list[SessionInfo],
                 start_scroll = max(0, cur_row - 1)
             if cur_row >= start_scroll + usable:
                 start_scroll = cur_row - usable + 1
-            draw_start_view(stdscr, items, rows, start_cursor, start_scroll,
-                            current_cwd, live, flash)
+            start_hits = draw_start_view(stdscr, items, rows, start_cursor, start_scroll,
+                                         current_cwd, live, flash)
 
             key = stdscr.getch()
             if key == -1:
                 continue
             flash = ""
+            if key == curses.KEY_MOUSE:
+                # Click selects, double-click (or a click on the selection) activates.
+                ev = read_mouse()
+                key = -1
+                if ev and ev[1] == 0 and ev[2] == "click" and tab_at(ev[0]) is not None:
+                    active_tab = tab_at(ev[0])
+                    continue
+                if ev and ev[2] in ("click", "double") and ev[1] in start_hits:
+                    idx = start_hits[ev[1]]
+                    key = 10 if (ev[2] == "double" or idx == start_cursor) else -1
+                    start_cursor = idx
+                elif ev and ev[2] in ("up", "down"):
+                    key = curses.KEY_UP if ev[2] == "up" else curses.KEY_DOWN
             if key in (3, 4, ord("q"), ord("Q")):
                 return None
             if key == 9:
@@ -1404,7 +1489,7 @@ def curses_main(stdscr, sessions: list[SessionInfo],
                     break
                 list_scroll += 1
 
-            draw_list_view(stdscr, display_sessions, cursor, list_scroll,
+            list_hits = draw_list_view(stdscr, display_sessions, cursor, list_scroll,
                            search_mode=search_mode, search_query=search_query,
                            active_query=active_query,
                            match_snippets=match_snippets if has_snippets else None,
@@ -1412,6 +1497,7 @@ def curses_main(stdscr, sessions: list[SessionInfo],
         else:
             detail_rendered_result = draw_detail_view(stdscr, display_sessions[cursor],
                                                       detail_scroll, flash)
+            detail_scroll = min(detail_scroll, max(0, len(detail_rendered_result) - (h - 4)))
 
         # Use get_wch in search mode for Unicode support, getch otherwise
         if mode == "list" and search_mode:
@@ -1464,6 +1550,24 @@ def curses_main(stdscr, sessions: list[SessionInfo],
         key = stdscr.getch()
         if key != -1:
             flash = ""
+        if key == curses.KEY_MOUSE:
+            # List: click expands, wheel moves the cursor. Detail: wheel scrolls.
+            ev = read_mouse()
+            key = -1
+            if ev and mode == "list" and ev[1] == 0 and ev[2] == "click" \
+                    and tab_at(ev[0]) is not None:
+                active_tab = tab_at(ev[0])
+                continue
+            if ev and mode == "list" and ev[2] in ("click", "double") and ev[1] in list_hits:
+                cursor = list_hits[ev[1]]
+                key = 10
+            elif ev and ev[2] in ("up", "down"):
+                if mode == "detail":
+                    step = -3 if ev[2] == "up" else 3
+                    detail_scroll = max(0, min(detail_scroll + step,
+                                               len(detail_rendered_result) - (h - 4)))
+                    continue
+                key = curses.KEY_UP if ev[2] == "up" else curses.KEY_DOWN
 
         # Ctrl+C (3) and Ctrl+D (4) always quit
         if key in (3, 4):
@@ -1496,7 +1600,8 @@ def curses_main(stdscr, sessions: list[SessionInfo],
                 if display_sessions:
                     load_messages(display_sessions[cursor])
                     mode = "detail"
-                    detail_scroll = 0
+                    detail_scroll = 10 ** 9  # open at the end: the latest messages
+
             elif key == curses.KEY_RESIZE:
                 pass  # redraw on next loop
 

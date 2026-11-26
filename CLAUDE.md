@@ -20,8 +20,10 @@ install.sh             # interactive installer: asks for the binary name, runs u
 - **Start** (tab 0). This tab has two sections:
   - *Running* shows the live sessions from `claude agents --json`. Enter attaches to a background session. A `terminal` session is a foreground `claude` in a different terminal, and you cannot attach to it. For such a session, Enter shows its tty and tells you to type `/bg` in it.
   - *New session in* shows the directories from the session history. The current directory is first. Enter starts a new session in the directory.
-- **Resume** (tab 1). This tab shows the recent sessions. `/` searches the session text. Enter expands a session, and Enter again resumes it. A running session has a `● status (kind)` marker. Enter attaches to a running background session. Enter does not resume a running terminal session, because that makes a copy.
+- **Resume** (tab 1). This tab shows the recent sessions, newest activity first. Each row shows the time (relative up to 7 days, then the date), the name or path, the stats, the first and last user messages, and the last agent reply. `/` searches the session text. Enter expands a session into the full chat, scrolled to the end. Enter again resumes it. A running session has a `● status (kind)` marker. Enter attaches to a running background session. Enter does not resume a running terminal session, because that makes a copy.
 - **Settings** (tab 2). Space or Enter toggles a setting. polyclaude saves the change immediately.
+
+**Mouse.** A click on a tab label opens the tab. On Start, a click selects an item, and a double-click (or a click on the selected item) activates it. On Resume, a click expands a session. The wheel moves the cursor in a list and scrolls the chat. The draw functions return `{screen row: item index}` for the click hit test. polyclaude captures the mouse, so the terminal needs Shift (or Option) to select text.
 
 ## Launch
 

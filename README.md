@@ -31,8 +31,11 @@ Enter on a running `bg` session attaches to it. Enter on a directory starts a ne
 │      24m  you:18  claude:40  tools:42  agents:3                        │
 │      first: fix flaky retry test in billing client                     │
 │       last: run the suite again                                        │
+│      reply: All 212 tests pass.                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+
+Each row shows the time, the name or path, the stats, the first and last user messages, and the last agent reply. A click or Enter opens the full chat at the end. The wheel scrolls it.
 
 ### Settings
 
@@ -80,6 +83,8 @@ polyclaude -b my-claude # use a different claude binary
 | `/`               | search the session text (Resume)       |
 | `Esc` / `←`       | go back / clear the search             |
 | `g` `G`           | top / bottom (expanded session)        |
+| mouse click       | open a tab / select / expand           |
+| mouse wheel       | move the cursor / scroll the chat      |
 | `q` / `^C` / `^D` | quit                                   |
 
 ## Config
