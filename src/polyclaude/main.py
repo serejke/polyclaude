@@ -1640,6 +1640,68 @@ def curses_main(stdscr, sessions: list[SessionInfo],
                 pass
 
 
+# ── Workspace trust ──────────────────────────────────────────────────────────
+#
+# `claude --bg` cannot show the trust dialog, so it refuses to start in a
+# directory that Claude Code has no trust record for. Claude Code keeps the
+# records in ~/.claude.json as projects[<dir>].hasTrustDialogAccepted. Inside a
+# git repository only records from the cwd up to the repository root count, so a
+# trusted parent such as ~/Desktop does not cover a repository in it. Outside a
+# repository, any trusted ancestor counts. polyclaude only reads these records:
+# when one is missing, it starts claude in the foreground, where claude asks.
+
+CLAUDE_GLOBAL_CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME)) / ".claude.json"
+
+
+def git_root(cwd: str) -> str | None:
+    try:
+        proc = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def trust_record_dir(cwd: str) -> str | None:
+    """The directory whose trust record is missing, or None if `cwd` is trusted.
+
+    Returns None as well when polyclaude cannot tell (no readable config, or the
+    home directory, whose trust Claude Code never records); claude then reports
+    the problem itself.
+    """
+    cwd = os.path.realpath(cwd)
+    if cwd == os.path.realpath(HOME):
+        return None
+    try:
+        projects = json.loads(CLAUDE_GLOBAL_CONFIG.read_text()).get("projects") or {}
+    except (OSError, ValueError, AttributeError):
+        return None
+    root = git_root(cwd)
+    d = cwd
+    while True:
+        rec = projects.get(d)
+        if isinstance(rec, dict) and rec.get("hasTrustDialogAccepted") is True:
+            return None
+        parent = os.path.dirname(d)
+        if d == root or parent == d:
+            return root or cwd
+        d = parent
+
+
+def untrusted_note(cwd: str) -> str | None:
+    """Why a background launch in `cwd` would fail, or None if it would not."""
+    missing = trust_record_dir(cwd)
+    if missing is None:
+        return None
+    short = missing.replace(HOME, "~")
+    return (f"Claude Code does not trust {short} yet, and a background session cannot ask.\n"
+            "Starting in the foreground, so claude asks itself. "
+            "Type /bg in the session to move it to the background.")
+
+
 def _exec_claude(binary: str, cwd: str, extra_args: list[str], skip_perms: bool,
                  background: bool = False):
     """Replace this process with claude in `cwd`.
@@ -1649,6 +1711,10 @@ def _exec_claude(binary: str, cwd: str, extra_args: list[str], skip_perms: bool,
     prints its id; we then exec `claude attach <id>`, a detachable viewer.
     """
     cwd_short = cwd.replace(HOME, "~")
+    note = untrusted_note(cwd) if background else None
+    if note:
+        background = False
+        print(f"{note}\n")
     argv = [binary]
     if background:
         argv.append("--bg")
@@ -1665,6 +1731,7 @@ def _exec_claude(binary: str, cwd: str, extra_args: list[str], skip_perms: bool,
     except OSError as e:
         sys.exit(f"Cannot enter {cwd_short}: {e.strerror}")
     if not background:
+        sys.stdout.flush()  # exec discards unflushed output
         os.execvp(binary, argv)
 
     # Capture stdout only: it carries the id. stdin and stderr stay on the
@@ -1681,6 +1748,7 @@ def _exec_claude(binary: str, cwd: str, extra_args: list[str], skip_perms: bool,
 def _exec_attach(binary: str, agent_id: str):
     argv = [binary, "attach", agent_id]
     print(f"  {' '.join(argv)}\n")
+    sys.stdout.flush()  # exec discards unflushed output
     os.execvp(binary, argv)
 
 

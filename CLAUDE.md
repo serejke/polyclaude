@@ -29,6 +29,7 @@ install.sh             # interactive installer: asks for the binary name, runs u
 
 - polyclaude does `os.chdir` to the session directory and then `os.execvp`. The new process replaces polyclaude.
 - **Background launch** (the default). polyclaude runs `claude --bg [--resume <id>]` and reads the id from the `claude attach <id>` line on stdout. Then it execs `claude attach <id>`. The session runs in the Claude background service, not in this terminal. Thus the session continues when the terminal or the ssh connection closes.
+- **Workspace trust.** `claude --bg` refuses an untrusted directory ("Workspace not trusted"), because it cannot show the dialog. Claude Code reads `projects[<dir>].hasTrustDialogAccepted` in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`): from the cwd up to the git root inside a repository, or up to `/` outside one. So a trusted `~/Desktop` does not cover a repository in it. `untrusted_note` mirrors this check (read-only) before a background launch; when the record is missing, `_exec_claude` falls back to the foreground so claude shows its own dialog. Never write `~/.claude.json`: it is Claude Code's internal state, not an interface. The home directory is skipped: Claude Code never records its trust.
 - polyclaude captures only stdout of `claude --bg`. stdin and stderr stay on the terminal, because `claude --bg` can show progress or ask a question there.
 - `--fg` starts claude in the foreground for one run. `--unsafe` adds `--dangerously-skip-permissions` for one run.
 

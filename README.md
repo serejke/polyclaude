@@ -115,6 +115,10 @@ Thus your terminal only shows the session. The terminal does not own the session
 
 In an attached session, push `←` to go to the agent view. Push `Ctrl+Z` to go back to the shell.
 
+### Workspace trust
+
+`claude --bg` cannot show the trust dialog, so it does not start in a directory that Claude Code does not trust yet. Inside a git repository, a trusted parent directory does not count: the repository needs its own trust. Before a background launch, polyclaude reads the trust records in `~/.claude.json`. If the directory is not trusted, polyclaude starts claude in the foreground instead, and claude shows its own trust dialog. To move that session to the background, type `/bg` in it. The next launch in the directory is a background launch again. polyclaude never writes to Claude Code's config.
+
 ### Terminal sessions
 
 A session that you start with plain `claude` is a `terminal` session. Its terminal owns the session. You cannot attach to it from a different terminal.
