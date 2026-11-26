@@ -26,7 +26,10 @@ Single-file architecture — everything lives in `main.py`. No runtime dependenc
 ## Key design decisions
 
 - **Pure stdlib**: only `curses`, `json`, `argparse`, `textwrap`, `dataclasses`. No pip deps.
-- **Lazy message loading**: initial scan only parses metadata (fast). Full conversation is loaded on expand.
+- **Lazy loading, three tiers**: the screen must appear without reading whole session files (they reach 100+ MB).
+  1. Startup: `scan_session_meta` reads only the head (sessionId, cwd, first user message) and the last 256 KB (last user message, last activity time, `custom-title`; falls back to the re-appended `last-prompt` line when tool output pushes the last user message out of the tail).
+  2. Background: `start_stats_loader` runs a full `parse_session` per session on a daemon thread and fills counters/duration (`stats_loaded`). The TUI polls with `stdscr.timeout(150)` until it finishes, then blocks again.
+  3. On demand: `raw_content` is read on the first `/` search (`ensure_raw`); the full conversation on expand (`load_messages`).
 - **Cached cwd peek**: New tab needs the `cwd` of every session jsonl. It reads the first ~5 lines of a file once and caches `{path: cwd}` in `~/.cache/polyclaude/cwds.json` (XDG-aware via `XDG_CACHE_HOME`). A session's cwd never changes, so entries need no invalidation; only new files are opened. Files with no cwd yet are not cached.
 - **Binary configurable**: `--binary` flag or `CLAUDE_BINARY` env var. Defaults to `claude`.
 - **exec-based launch**: uses `os.execvp` after `os.chdir` — replaces the process entirely, so the resumed Claude session inherits the correct cwd.
@@ -51,7 +54,7 @@ Sessions live in `~/.claude/projects/<path-with-dashes>/<uuid>.jsonl`. Each line
 - Use `safe_addstr()` for all curses writes — it handles screen boundary clipping.
 - Tab bar lives at row 0; rendered by `draw_tab_bar(stdscr, active_tab, help_text)` and called from each tab's draw function.
 - New settings: add a row to `SETTINGS_ITEMS` (key, label, help text) and a field to `Config`. Save/load round-trips JSON. The UI iterates `SETTINGS_ITEMS` automatically.
-- Stats (user_msgs, assistant_msgs, agent_msgs, tool_uses, duration_min) are computed during initial parse, not during lazy load.
+- Stats (user_msgs, assistant_msgs, agent_msgs, tool_uses, duration_min) are filled by the background loader; draw code must handle `stats_loaded == False`.
 
 ## Versioning & releases
 

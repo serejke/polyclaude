@@ -27,6 +27,7 @@ import locale
 import os
 import sys
 import textwrap
+import threading
 import time
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
@@ -112,7 +113,9 @@ class SessionInfo:
     duration_min: int = 0
     messages: list[ChatMessage] = field(default_factory=list)
     messages_loaded: bool = False
+    stats_loaded: bool = False  # counters/duration come from a full parse, done in the background
     raw_content: str = ""
+    raw_loaded: bool = False    # raw_content is read on the first search
 
 
 @dataclass
@@ -152,6 +155,18 @@ def is_noise(text: str) -> bool:
         or text.startswith("<command-message>")
         or not text
     )
+
+
+def human_user_text(obj: dict) -> str | None:
+    """Text of a human-typed user message, or None for anything else
+    (assistant turns, tool results, slash-command noise, metadata lines)."""
+    if obj.get("type") != "user":
+        return None
+    content = obj.get("message", {}).get("content", "")
+    if is_tool_result_only(content):
+        return None
+    text = extract_text(content)
+    return None if is_noise(text) else text
 
 
 def truncate(text: str, length: int = 120) -> str:
@@ -417,6 +432,141 @@ def parse_session(jsonl_path: Path, load_messages: bool = False) -> SessionInfo 
     )
 
 
+HEAD_MAX_BYTES = 1 << 20   # first user message must appear within this prefix
+TAIL_BYTES = 256 << 10     # Claude Code re-appends custom-title near the end; observed < 40 KB
+
+
+def _json_lines(data: bytes):
+    for raw in data.split(b"\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def scan_session_meta(jsonl_path: Path) -> SessionInfo | None:
+    """List-row metadata from the head and tail of the file only.
+
+    Session files reach 100+ MB, so a full parse is too slow for startup.
+    The head gives sessionId, cwd and the first user message; the tail gives
+    the last user message and the name. Counters and duration need every line
+    and are filled later by ``load_stats``.
+    """
+    session_id = cwd = first_user = ts_first = None
+    try:
+        size = jsonl_path.stat().st_size
+        mtime = jsonl_path.stat().st_mtime
+        with open(jsonl_path, "rb") as f:
+            read = 0
+            for raw in f:
+                read += len(raw)
+                if read > HEAD_MAX_BYTES:
+                    break
+                try:
+                    obj = json.loads(raw.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                session_id = session_id or obj.get("sessionId")
+                cwd = cwd or obj.get("cwd")
+                text = human_user_text(obj)
+                if text:
+                    first_user, ts_first = text, obj.get("timestamp", "")
+                    break
+            if not first_user or not session_id:
+                return None
+            start = max(0, size - TAIL_BYTES)
+            f.seek(start)
+            tail = f.read()
+    except OSError:
+        return None
+    if start > 0:
+        tail = tail[tail.find(b"\n") + 1:]  # drop the partial first line
+
+    # ts_last is the last activity in the file. last_user is the last human
+    # message; when long tool output pushes it out of the tail, Claude Code's
+    # periodically re-appended "last-prompt" line still carries it.
+    last_user = ts_last = None
+    last_prompt = None
+    name = ""
+    for obj in reversed(list(_json_lines(tail))):
+        if ts_last is None and obj.get("timestamp"):
+            ts_last = obj["timestamp"]
+        otype = obj.get("type")
+        if not name and otype == "custom-title":
+            title = obj.get("customTitle")
+            if isinstance(title, str) and title.strip():
+                name = title.strip()
+        if last_prompt is None and otype == "last-prompt":
+            lp = obj.get("lastPrompt")
+            if isinstance(lp, str) and not is_noise(lp.strip()):
+                last_prompt = lp.strip()
+        if last_user is None:
+            last_user = human_user_text(obj)
+        if name and last_user is not None and ts_last is not None:
+            break
+    last_user = last_user or last_prompt
+
+    return SessionInfo(
+        session_id=session_id,
+        cwd=cwd or "?",
+        file_path=jsonl_path,
+        mtime=mtime,
+        name=name,
+        first_user_msg=first_user,
+        last_user_msg=last_user or first_user,
+        timestamp_first=ts_first or "",
+        timestamp_last=ts_last or ts_first or "",
+    )
+
+
+def load_stats(session: SessionInfo) -> None:
+    """Fill counters and duration from a full parse (slow; run off the UI thread)."""
+    if session.stats_loaded:
+        return
+    full = parse_session(session.file_path)
+    if full:
+        session.user_msgs = full.user_msgs
+        session.assistant_msgs = full.assistant_msgs
+        session.agent_msgs = full.agent_msgs
+        session.tool_uses = full.tool_uses
+        session.duration_min = full.duration_min
+        session.last_user_msg = full.last_user_msg  # authoritative over the tail guess
+        if full.name:
+            session.name = full.name
+    session.stats_loaded = True
+
+
+def start_stats_loader(sessions: list[SessionInfo]) -> threading.Event:
+    """Load stats for `sessions` in order on a daemon thread; the event is set when done."""
+    done = threading.Event()
+
+    def run():
+        for s in sessions:
+            load_stats(s)
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    return done
+
+
+def ensure_raw(session: SessionInfo) -> None:
+    """Read the whole file for full-text search, once."""
+    if session.raw_loaded:
+        return
+    try:
+        session.raw_content = session.file_path.read_text(errors="replace")
+    except OSError:
+        pass
+    session.raw_loaded = True
+
+
 def load_messages(session: SessionInfo):
     """Lazily load full conversation for a session."""
     if session.messages_loaded:
@@ -472,16 +622,12 @@ def find_sessions(top_n: int) -> list[SessionInfo]:
     legacy_names = load_session_names()
     sessions = []
     for _, path in candidates:
-        info = parse_session(path)
+        info = scan_session_meta(path)
         if info:
             # New format: name parsed from the jsonl's custom-title line.
             # Old format: fall back to the legacy per-pid sessions store.
             if not info.name:
                 info.name = legacy_names.get(info.session_id, "")
-            try:
-                info.raw_content = path.read_text(errors="replace")
-            except OSError:
-                pass
             sessions.append(info)
         if len(sessions) >= top_n:
             break
@@ -513,6 +659,8 @@ def section_header(idx: int, sessions: list[SessionInfo], current_cwd: str,
 def search_sessions(sessions: list[SessionInfo], query: str) -> list[SessionInfo]:
     """Filter sessions whose raw_content contains query (case-insensitive)."""
     q = query.lower()
+    for s in sessions:
+        ensure_raw(s)
     return [s for s in sessions if q in s.raw_content.lower()]
 
 
@@ -816,13 +964,16 @@ def draw_list_view(stdscr, sessions: list[SessionInfo], cursor: int, scroll: int
             y += 1
 
             # Line 2: stats
-            if s.duration_min >= 60:
-                dur = f"{s.duration_min // 60}h{s.duration_min % 60:02d}m"
+            if not s.stats_loaded:
+                stats = "…"
             else:
-                dur = f"{s.duration_min}m"
-            stats = f"{dur}  you:{s.user_msgs}  claude:{s.assistant_msgs}  tools:{s.tool_uses}"
-            if s.agent_msgs > 0:
-                stats += f"  agents:{s.agent_msgs}"
+                if s.duration_min >= 60:
+                    dur = f"{s.duration_min // 60}h{s.duration_min % 60:02d}m"
+                else:
+                    dur = f"{s.duration_min}m"
+                stats = f"{dur}  you:{s.user_msgs}  claude:{s.assistant_msgs}  tools:{s.tool_uses}"
+                if s.agent_msgs > 0:
+                    stats += f"  agents:{s.agent_msgs}"
             safe_addstr(stdscr, y, 5, stats, attr_dim)
             y += 1
 
@@ -949,12 +1100,11 @@ def draw_detail_view(stdscr, session: SessionInfo, scroll: int) -> list[str]:
 
 def curses_main(stdscr, sessions: list[SessionInfo],
                 cwd_entries: list[CwdEntry], current_cwd: str,
-                cfg: Config,
+                cfg: Config, stats_done: threading.Event | None = None,
                 ) -> tuple[str, object] | None:
     """Returns ("new", cwd_str) | ("resume", SessionInfo) | None."""
     curses.curs_set(0)
     init_colors()
-    stdscr.timeout(-1)
 
     active_tab = 0 if cwd_entries else 1  # default to New if we have cwds
 
@@ -981,6 +1131,10 @@ def curses_main(stdscr, sessions: list[SessionInfo],
     match_snippets: dict[str, list[str]] = {}
 
     while True:
+        # While stats load in the background, wake up periodically to redraw
+        # them; getch returns -1 on timeout, which no key handler matches.
+        loading = stats_done is not None and not stats_done.is_set()
+        stdscr.timeout(150 if loading else -1)
         h, w = stdscr.getmaxyx()
         display_sessions = filtered_sessions if filtered_sessions is not None else all_sessions
         has_snippets = filtered_sessions is not None
@@ -1237,6 +1391,7 @@ def main():
     cwd_entries = collect_recent_cwds(args.cwd_limit, current_cwd)
     sessions = find_sessions(args.count)
     sessions = partition_by_cwd(sessions, current_cwd)
+    stats_done = start_stats_loader(sessions)
     cfg = load_config()
 
     if not cwd_entries and not sessions:
@@ -1245,7 +1400,8 @@ def main():
         cwd_entries = [CwdEntry(current_cwd, 0, 0.0)]
 
     action = curses.wrapper(
-        lambda stdscr: curses_main(stdscr, sessions, cwd_entries, current_cwd, cfg)
+        lambda stdscr: curses_main(stdscr, sessions, cwd_entries, current_cwd, cfg,
+                                    stats_done)
     )
 
     if action is None:
