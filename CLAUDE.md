@@ -18,10 +18,11 @@ Single-file architecture — everything lives in `main.py`. No runtime dependenc
 ## Tabs
 
 - **New session** (tab 0): list of cwds extracted from session history, current dir pinned at top. Enter launches `claude` (with `--dangerously-skip-permissions` per config).
-- **Resume** (tab 1): existing picker. `/` to search session text, Enter to expand, Enter again to resume.
-- **Settings** (tab 2): list of toggles. Space/Enter toggles; saved immediately to `~/.config/polyclaude/config.json`.
+- **Running** (tab 1): live sessions from `claude agents --json` (polled every 2 s by `LivePoller` on a daemon thread): status (busy / waiting / idle), name, cwd, kind. Enter attaches to a background session; interactive ones belong to another terminal and can't be attached.
+- **Resume** (tab 2): existing picker. `/` to search session text, Enter to expand, Enter again to resume. Rows of running sessions carry a `● status (kind)` marker; Enter on a running background session attaches instead of resuming a copy.
+- **Settings** (tab 3): list of toggles. Space/Enter toggles; saved immediately to `~/.config/polyclaude/config.json`.
 
-`Tab` cycles 0 → 1 → 2 → 0.
+`Tab` cycles 0 → 1 → 2 → 3 → 0. Tab indices are the `TAB_*` constants. The New tab also shows how many sessions run in each cwd.
 
 ## Key design decisions
 
@@ -54,6 +55,7 @@ Sessions live in `~/.claude/projects/<path-with-dashes>/<uuid>.jsonl`. Each line
 - Colors are defined via curses color pairs in `init_colors()`. Pair constants: `C_IDX`, `C_PATH`, `C_LABEL`, `C_TEXT`, `C_SELECTED`, `C_ASSISTANT`, `C_AGENT`, `C_HEADER`.
 - Use `safe_addstr()` for all curses writes — it handles screen boundary clipping.
 - Tab bar lives at row 0; rendered by `draw_tab_bar(stdscr, active_tab, help_text)` and called from each tab's draw function.
+- The main loop redraws on a `stdscr.timeout` (150 ms while stats load, 1 s for live status, blocking in the detail view). `getch` returns -1 on timeout; key handlers must ignore it.
 - New settings: add a row to `SETTINGS_ITEMS` (key, label, help text) and a field to `Config`. Save/load round-trips JSON. The UI iterates `SETTINGS_ITEMS` automatically.
 - Stats (user_msgs, assistant_msgs, agent_msgs, tool_uses, duration_min) are filled by the background loader; draw code must handle `stats_loaded == False`.
 
