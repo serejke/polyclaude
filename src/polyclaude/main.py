@@ -43,6 +43,8 @@ SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 HOME = str(Path.home())
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "polyclaude"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "polyclaude"
+CWD_CACHE_PATH = CACHE_DIR / "cwds.json"
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -210,11 +212,42 @@ def peek_session_cwd(path: Path, max_lines: int = 5) -> str | None:
     return None
 
 
+def load_cwd_cache() -> dict[str, str]:
+    """``{jsonl path: cwd}`` from previous runs.
+
+    A session's cwd is written in its first lines when the file is created and
+    never changes, so an entry stays valid for the file's whole life: no mtime
+    check is needed, only new files have to be peeked.
+    """
+    try:
+        with open(CWD_CACHE_PATH) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    cwds = data.get("cwds") if isinstance(data, dict) else None
+    return cwds if isinstance(cwds, dict) else {}
+
+
+def save_cwd_cache(cwds: dict[str, str]) -> None:
+    """Write atomically (tmp + rename) so a concurrent run never reads half a file."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CWD_CACHE_PATH.with_suffix(f".{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            json.dump({"version": 1, "cwds": cwds}, f)
+        os.replace(tmp, CWD_CACHE_PATH)
+    except OSError:
+        pass
+
+
 def collect_recent_cwds(limit: int, current_cwd: str | None) -> list[CwdEntry]:
     """Walk all session files, group by cwd, return recent ones with current pinned."""
     if not CLAUDE_DIR.is_dir():
         return [CwdEntry(current_cwd, 0, 0.0)] if current_cwd else []
 
+    cached = load_cwd_cache()
+    # Rebuilt from scratch each run: entries for deleted files drop out.
+    fresh: dict[str, str] = {}
     stats: dict[str, dict] = {}
     for project_dir in CLAUDE_DIR.iterdir():
         if not project_dir.is_dir():
@@ -226,13 +259,22 @@ def collect_recent_cwds(limit: int, current_cwd: str | None) -> list[CwdEntry]:
                 mtime = f.stat().st_mtime
             except OSError:
                 continue
-            cwd = peek_session_cwd(f)
+            key = str(f)
+            cwd = cached.get(key)
+            if cwd is None:
+                # Files without a cwd yet are not cached: a session that is
+                # still being written may gain one later.
+                cwd = peek_session_cwd(f)
             if not cwd:
                 continue
+            fresh[key] = cwd
             d = stats.setdefault(cwd, {"count": 0, "last": 0.0})
             d["count"] += 1
             if mtime > d["last"]:
                 d["last"] = mtime
+
+    if fresh != cached:
+        save_cwd_cache(fresh)
 
     entries = [CwdEntry(cwd, d["count"], d["last"]) for cwd, d in stats.items()]
     entries.sort(key=lambda e: e.last_used_epoch, reverse=True)

@@ -27,7 +27,7 @@ Single-file architecture — everything lives in `main.py`. No runtime dependenc
 
 - **Pure stdlib**: only `curses`, `json`, `argparse`, `textwrap`, `dataclasses`. No pip deps.
 - **Lazy message loading**: initial scan only parses metadata (fast). Full conversation is loaded on expand.
-- **Cheap cwd peek**: New tab walks all session jsonl files but only reads the first ~5 lines per file to extract `cwd`. Sub-second across hundreds of sessions.
+- **Cached cwd peek**: New tab needs the `cwd` of every session jsonl. It reads the first ~5 lines of a file once and caches `{path: cwd}` in `~/.cache/polyclaude/cwds.json` (XDG-aware via `XDG_CACHE_HOME`). A session's cwd never changes, so entries need no invalidation; only new files are opened. Files with no cwd yet are not cached.
 - **Binary configurable**: `--binary` flag or `CLAUDE_BINARY` env var. Defaults to `claude`.
 - **exec-based launch**: uses `os.execvp` after `os.chdir` — replaces the process entirely, so the resumed Claude session inherits the correct cwd.
 - **Persistent config** at `~/.config/polyclaude/config.json` (XDG-aware via `XDG_CONFIG_HOME`). Schema: `{"skip_permissions": bool}`. Defaults to `false` (permissions enforced); toggles auto-save. Enable in config/Settings to skip permission prompts.
