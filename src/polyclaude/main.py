@@ -1620,10 +1620,13 @@ def main():
         # Still allow launching in current dir
         cwd_entries = [CwdEntry(current_cwd, 0, 0.0)]
 
-    action = curses.wrapper(
-        lambda stdscr: curses_main(stdscr, sessions, cwd_entries, current_cwd, cfg,
-                                    stats_done, live)
-    )
+    try:
+        action = curses.wrapper(
+            lambda stdscr: curses_main(stdscr, sessions, cwd_entries, current_cwd, cfg,
+                                        stats_done, live)
+        )
+    except KeyboardInterrupt:  # Ctrl+C arrives as SIGINT in cbreak mode
+        sys.exit(130)
 
     if action is None:
         sys.exit(0)
